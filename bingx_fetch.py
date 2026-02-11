@@ -3,6 +3,7 @@ import time
 import signal
 import argparse
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,7 @@ all_klines = []
 filepath = None
 logfilepath = None
 interrupted = False
+write_log_enabled = False
 
 
 # --- Цвета для консоли ---
@@ -110,32 +112,42 @@ def fetch_klines(
 
 def write_log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    if not logfilepath:
+    if not write_log_enabled or not logfilepath:
         return
     with open(logfilepath, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {msg}\n")
 
 
-def save_progress():
-    global all_klines, filepath
+def write_log_to(msg: str, target_logfilepath: Optional[str]):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    if not write_log_enabled or not target_logfilepath:
+        return
+    with open(target_logfilepath, "a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {msg}\n")
 
-    if not all_klines or not filepath:
+
+def save_klines_progress(klines, target_filepath: Optional[str], target_logfilepath: Optional[str]):
+    if not klines or not target_filepath:
         return
 
-    df = pd.DataFrame(all_klines)
-
-    # сортируем и удаляем дубликаты
+    df = pd.DataFrame(klines)
     df.sort_values(by="time", inplace=True)
     df.drop_duplicates(subset="time", inplace=True)
 
     df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df.to_csv(filepath, index=False)
+    df.to_csv(target_filepath, index=False)
 
     last_time = df["time"].max()
     msg = f"Сохранено {len(df)} свечей, последняя свеча: {last_time}"
 
     print(f"{Color.GREEN}{msg}{Color.RESET}")
-    write_log(msg)
+    write_log_to(msg, target_logfilepath)
+
+
+def save_progress():
+    global all_klines, filepath
+
+    save_klines_progress(all_klines, filepath, logfilepath)
 
 
 def signal_handler(sig, frame):
@@ -259,10 +271,12 @@ def parse_download_filename(filename: str):
 def fetch_to_file_with_resume(
     symbol: str, interval: str, fromdate: datetime, todate: datetime, target_path: str
 ):
-    global all_klines, filepath
-
-    all_klines = []
-    filepath = target_path
+    local_klines = []
+    local_log_path = (
+        target_path.replace(".csv", ".log")
+        if target_path.lower().endswith(".csv")
+        else f"{target_path}.log"
+    )
     end_ms = datetime_to_ms(todate)
 
     if os.path.exists(target_path):
@@ -272,13 +286,13 @@ def fetch_to_file_with_resume(
             last_time_dt = df["time"].max()
             current_time_ms = datetime_to_ms(last_time_dt) + interval_to_ms(interval)
             df["time"] = datetime_series_to_ms(df["time"])
-            all_klines = df.to_dict("records")
+            local_klines = df.to_dict("records")
             msg = (
                 f"[RESUME PART] Продолжаем докачку из {os.path.basename(target_path)} "
                 f"с {last_time_dt}"
             )
             print(f"{Color.CYAN}{msg}{Color.RESET}")
-            write_log(msg)
+            write_log_to(msg, local_log_path)
         else:
             current_time_ms = datetime_to_ms(fromdate)
     else:
@@ -297,20 +311,23 @@ def fetch_to_file_with_resume(
         if not chunk:
             break
 
-        all_klines.extend(chunk)
+        local_klines.extend(chunk)
 
-        if len(all_klines) % 5000 < 1000:
-            save_progress()
+        if len(local_klines) % 5000 < 1000:
+            save_klines_progress(local_klines, target_path, local_log_path)
 
         prev_time_ms = current_time_ms
         last_open_ms = int(chunk[0]["time"])
         current_time_ms = last_open_ms + interval_to_ms(interval)
         if current_time_ms <= prev_time_ms:
-            write_log("[ERROR] Некорректный шаг времени от API, останавливаю докачку.")
+            write_log_to(
+                "[ERROR] Некорректный шаг времени от API, останавливаю докачку.",
+                local_log_path,
+            )
             break
 
         print(
-            f"{Color.CYAN}Докачано {len(all_klines)} свечей в {os.path.basename(target_path)}, до {ms_to_datetime(last_open_ms)}{Color.RESET}"
+            f"{Color.CYAN}Докачано {len(local_klines)} свечей в {os.path.basename(target_path)}, до {ms_to_datetime(last_open_ms)}{Color.RESET}"
         )
 
         if len(chunk) < 1000:
@@ -318,12 +335,145 @@ def fetch_to_file_with_resume(
 
         time.sleep(0.5)
 
-    save_progress()
+    save_klines_progress(local_klines, target_path, local_log_path)
     return not interrupted
 
 
-def update_existing_files():
-    global logfilepath
+def _build_update_task(downloads_path: str, filename: str, today):
+    parsed = parse_download_filename(filename)
+    if not parsed:
+        return None
+
+    symbol = parsed["symbol"]
+    interval = parsed["interval"]
+    csv_path = os.path.join(downloads_path, filename)
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"{Color.RED}Не удалось прочитать {filename}: {e}{Color.RESET}")
+        return None
+
+    if df.empty or "time" not in df.columns:
+        print(
+            f"{Color.YELLOW}Пропускаю {filename}: файл пустой или нет колонки time.{Color.RESET}"
+        )
+        return None
+
+    df["time"] = pd.to_datetime(df["time"])
+    last_time = df["time"].max()
+    last_date = last_time.date()
+    if last_date >= today:
+        print(f"{Color.GREEN}{filename}: уже актуален ({last_date}).{Color.RESET}")
+        return None
+
+    from_dt = last_time + timedelta(milliseconds=interval_to_ms(interval))
+    end_dt = datetime.now()
+    if from_dt >= end_dt:
+        print(f"{Color.GREEN}{filename}: уже актуален ({last_date}).{Color.RESET}")
+        return None
+
+    return {
+        "downloads_path": downloads_path,
+        "filename": filename,
+        "parsed": parsed,
+        "symbol": symbol,
+        "interval": interval,
+        "file_start": parsed["start"],
+        "file_end": parsed["end"],
+        "csv_path": csv_path,
+        "from_dt": from_dt,
+        "end_dt": end_dt,
+    }
+
+
+def _update_existing_file_task(task):
+    filename = task["filename"]
+    symbol = task["symbol"]
+    interval = task["interval"]
+    file_start = task["file_start"]
+    csv_path = task["csv_path"]
+    from_dt = task["from_dt"]
+    end_dt = task["end_dt"]
+    parsed = task["parsed"]
+    downloads_path = task["downloads_path"]
+
+    part_filename = f"{symbol}_{interval}_{parsed['end']}_update.part.csv"
+    part_csv_path = os.path.join(downloads_path, part_filename)
+    part_log_path = os.path.join(downloads_path, part_filename.replace(".csv", ".log"))
+    msg = (
+        f"[UPDATE START] {filename}: отдельная докачка в {part_filename} "
+        f"с {from_dt.strftime('%Y-%m-%d %H:%M:%S')} до {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    print(f"{Color.CYAN}{msg}{Color.RESET}")
+    write_log_to(msg, part_log_path)
+
+    completed = fetch_to_file_with_resume(
+        symbol=symbol,
+        interval=interval,
+        fromdate=from_dt,
+        todate=end_dt,
+        target_path=part_csv_path,
+    )
+    if not completed:
+        warning_msg = (
+            f"Докачка прервана, прогресс сохранён в {part_filename}. "
+            "Повторный запуск продолжит с этого места."
+        )
+        print(f"{Color.YELLOW}{warning_msg}{Color.RESET}")
+        return {"status": "interrupted", "filename": filename}
+
+    if not os.path.exists(part_csv_path):
+        print(f"{Color.YELLOW}{filename}: файл докачки не создан, пропускаю.{Color.RESET}")
+        return {"status": "skipped", "filename": filename}
+
+    base_df = pd.read_csv(csv_path)
+    part_df = pd.read_csv(part_csv_path)
+    if part_df.empty or "time" not in part_df.columns:
+        print(f"{Color.YELLOW}{filename}: новых данных не получено.{Color.RESET}")
+        return {"status": "skipped", "filename": filename}
+
+    base_df["time"] = pd.to_datetime(base_df["time"])
+    part_df["time"] = pd.to_datetime(part_df["time"])
+    merged = pd.concat([base_df, part_df], ignore_index=True)
+    merged.sort_values(by="time", inplace=True)
+    merged.drop_duplicates(subset="time", inplace=True)
+
+    new_last_time = merged["time"].max()
+    new_end = new_last_time.strftime("%Y-%m-%d")
+    new_filename = f"{symbol}_{interval}_{file_start}_{new_end}.csv"
+    new_logfilename = new_filename.replace(".csv", ".log")
+    new_csv_path = os.path.join(downloads_path, new_filename)
+    new_log_path = os.path.join(downloads_path, new_logfilename)
+
+    merged.to_csv(new_csv_path, index=False)
+
+    if filename != new_filename and os.path.exists(csv_path):
+        os.remove(csv_path)
+
+    if os.path.exists(part_log_path):
+        if os.path.exists(new_log_path):
+            with open(part_log_path, "r", encoding="utf-8") as src, open(
+                new_log_path, "a", encoding="utf-8"
+            ) as dst:
+                dst.write(src.read())
+            os.remove(part_log_path)
+        else:
+            os.replace(part_log_path, new_log_path)
+    if os.path.exists(part_csv_path):
+        os.remove(part_csv_path)
+
+    write_log_to(
+        f"[UPDATE END] Обновлён файл {new_filename}. Всего свечей: {len(merged)}, последняя: {new_last_time}.",
+        new_log_path,
+    )
+    print(
+        f"{Color.GREEN}✅ Обновлён: {new_filename}, свечей: {len(merged)}, до {new_last_time}{Color.RESET}"
+    )
+    return {"status": "updated", "filename": filename}
+
+
+def update_existing_files(multithreading: bool = True):
 
     modpath = os.path.dirname(os.path.abspath(__file__))
     downloads_path = os.path.join(modpath, "downloads")
@@ -338,115 +488,40 @@ def update_existing_files():
         print(f"{Color.YELLOW}В downloads нет CSV файлов для обновления.{Color.RESET}")
         return
 
+    tasks = []
     for filename in csv_files:
-        parsed = parse_download_filename(filename)
-        if not parsed:
-            continue
+        task = _build_update_task(downloads_path, filename, today)
+        if task:
+            tasks.append(task)
 
-        symbol = parsed["symbol"]
-        interval = parsed["interval"]
-        file_start = parsed["start"]
-        csv_path = os.path.join(downloads_path, filename)
-        logfilepath = get_filepath(filename.replace(".csv", ".log"))
+    if not tasks:
+        print(f"{Color.GREEN}Нет файлов, требующих обновления.{Color.RESET}")
+        return
 
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception as e:
-            print(f"{Color.RED}Не удалось прочитать {filename}: {e}{Color.RESET}")
-            continue
+    if not multithreading or len(tasks) == 1:
+        for task in tasks:
+            result = _update_existing_file_task(task)
+            if result["status"] == "interrupted":
+                return
+        return
 
-        if df.empty or "time" not in df.columns:
-            print(
-                f"{Color.YELLOW}Пропускаю {filename}: файл пустой или нет колонки time.{Color.RESET}"
-            )
-            continue
-
-        df["time"] = pd.to_datetime(df["time"])
-        last_time = df["time"].max()
-        last_date = last_time.date()
-
-        if last_date >= today:
-            print(f"{Color.GREEN}{filename}: уже актуален ({last_date}).{Color.RESET}")
-            continue
-
-        from_dt = last_time + timedelta(milliseconds=interval_to_ms(interval))
-        end_dt = datetime.now()
-        if from_dt >= end_dt:
-            print(f"{Color.GREEN}{filename}: уже актуален ({last_date}).{Color.RESET}")
-            continue
-
-        part_filename = f"{symbol}_{interval}_{parsed['end']}_update.part.csv"
-        part_csv_path = os.path.join(downloads_path, part_filename)
-        part_log_path = os.path.join(downloads_path, part_filename.replace(".csv", ".log"))
-        logfilepath = part_log_path
-        msg = (
-            f"[UPDATE START] {filename}: отдельная докачка в {part_filename} "
-            f"с {from_dt.strftime('%Y-%m-%d %H:%M:%S')} до {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        print(f"{Color.CYAN}{msg}{Color.RESET}")
-        write_log(msg)
-
-        completed = fetch_to_file_with_resume(
-            symbol=symbol,
-            interval=interval,
-            fromdate=from_dt,
-            todate=end_dt,
-            target_path=part_csv_path,
-        )
-        if not completed:
-            print(
-                f"{Color.YELLOW}Докачка прервана, прогресс сохранён в {part_filename}. Повторный запуск продолжит с этого места.{Color.RESET}"
-            )
-            return
-
-        if not os.path.exists(part_csv_path):
-            print(f"{Color.YELLOW}{filename}: файл докачки не создан, пропускаю.{Color.RESET}")
-            continue
-
-        part_df = pd.read_csv(part_csv_path)
-        if part_df.empty or "time" not in part_df.columns:
-            print(f"{Color.YELLOW}{filename}: новых данных не получено.{Color.RESET}")
-            continue
-
-        part_df["time"] = pd.to_datetime(part_df["time"])
-        merged = pd.concat([df, part_df], ignore_index=True)
-        merged.sort_values(by="time", inplace=True)
-        merged.drop_duplicates(subset="time", inplace=True)
-
-        new_last_time = merged["time"].max()
-        new_end = new_last_time.strftime("%Y-%m-%d")
-        new_filename = f"{symbol}_{interval}_{file_start}_{new_end}.csv"
-        new_logfilename = new_filename.replace(".csv", ".log")
-        new_csv_path = os.path.join(downloads_path, new_filename)
-        new_log_path = os.path.join(downloads_path, new_logfilename)
-
-        merged.to_csv(new_csv_path, index=False)
-
-        if filename != new_filename and os.path.exists(csv_path):
-            os.remove(csv_path)
-
-        if os.path.exists(part_log_path):
-            if os.path.exists(new_log_path):
-                with open(part_log_path, "r", encoding="utf-8") as src, open(
-                    new_log_path, "a", encoding="utf-8"
-                ) as dst:
-                    dst.write(src.read())
-                os.remove(part_log_path)
-            else:
-                os.replace(part_log_path, new_log_path)
-        if os.path.exists(part_csv_path):
-            os.remove(part_csv_path)
-
-        logfilepath = new_log_path
-        write_log(
-            f"[UPDATE END] Обновлён файл {new_filename}. Всего свечей: {len(merged)}, последняя: {new_last_time}."
-        )
-        print(
-            f"{Color.GREEN}✅ Обновлён: {new_filename}, свечей: {len(merged)}, до {new_last_time}{Color.RESET}"
-        )
+    workers = min(os.cpu_count() or 1, len(tasks))
+    print(f"{Color.CYAN}Многопоточный режим: {workers} поток(ов), файлов к обновлению: {len(tasks)}.{Color.RESET}")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_update_existing_file_task, task) for task in tasks]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+            except Exception as e:
+                print(f"{Color.RED}Ошибка в потоке обновления: {e}{Color.RESET}")
+                continue
+            if result.get("status") == "interrupted":
+                return
 
 
 def main():
+    global write_log_enabled
+
     parser = argparse.ArgumentParser(
         description="""Скачивание исторических данных свечей с BingX API.
 Примеры использования:
@@ -486,14 +561,25 @@ def main():
         action="store_true",
         help="Обновить все существующие CSV в downloads до текущей даты",
     )
+    parser.add_argument(
+        "--write-log",
+        action="store_true",
+        help="Записывать лог в .log файл (по умолчанию лог пишется только в консоль)",
+    )
+    parser.add_argument(
+        "--no-multithreading",
+        action="store_true",
+        help="Для --update-existing: отключить многопоточность и обновлять файлы последовательно",
+    )
     args = parser.parse_args()
+    write_log_enabled = args.write_log
 
     if args.update_existing:
         if args.lastdays or args.fromdate or args.todate:
             raise ValueError(
                 "С флагом --update-existing нельзя использовать --lastdays, --fromdate и --todate."
             )
-        update_existing_files()
+        update_existing_files(multithreading=not args.no_multithreading)
         return
 
     # Проверка конфликтов
