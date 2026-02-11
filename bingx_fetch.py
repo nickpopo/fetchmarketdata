@@ -28,11 +28,16 @@ def get_filepath(filename):
 
 
 def datetime_to_ms(foo):
-    return int(foo.timestamp() * 1000)
+    return int(pd.Timestamp(foo).value // 1_000_000)
 
 
 def ms_to_datetime(foo):
     return datetime.fromtimestamp(foo / 1000)
+
+
+def datetime_series_to_ms(series):
+    dt = pd.to_datetime(series)
+    return dt.map(datetime_to_ms)
 # ====== END HELPERS ======
 
 # глобальные переменные
@@ -126,7 +131,7 @@ def save_progress():
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     df.to_csv(filepath, index=False)
 
-    last_time = pd.to_datetime(df["time"].max(), unit="ms")
+    last_time = df["time"].max()
     msg = f"Сохранено {len(df)} свечей, последняя свеча: {last_time}"
 
     print(f"{Color.GREEN}{msg}{Color.RESET}")
@@ -183,7 +188,7 @@ def fetch_and_save(symbol="ETH-USDT", interval="5m", fromdate=None, todate=None)
             print(f"{Color.CYAN}{msg}{Color.RESET}")
             write_log(msg)
             current_time_ms = datetime_to_ms(last_time_dt) + interval_to_ms(interval)
-            df['time'] = df["time"].astype("int64") // 10**6
+            df["time"] = datetime_series_to_ms(df["time"])
             all_klines = df.to_dict("records")
         else:
             all_klines = []
@@ -266,7 +271,7 @@ def fetch_to_file_with_resume(
             df["time"] = pd.to_datetime(df["time"])
             last_time_dt = df["time"].max()
             current_time_ms = datetime_to_ms(last_time_dt) + interval_to_ms(interval)
-            df["time"] = df["time"].astype("int64") // 10**6
+            df["time"] = datetime_series_to_ms(df["time"])
             all_klines = df.to_dict("records")
             msg = (
                 f"[RESUME PART] Продолжаем докачку из {os.path.basename(target_path)} "
