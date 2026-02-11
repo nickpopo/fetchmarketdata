@@ -2,6 +2,7 @@ import os
 import time
 import signal
 import argparse
+import re
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -104,6 +105,8 @@ def fetch_klines(
 
 def write_log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    if not logfilepath:
+        return
     with open(logfilepath, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {msg}\n")
 
@@ -242,6 +245,202 @@ def valid_date(date_str):
         )
 
 
+def parse_download_filename(filename: str):
+    pattern = r"^(?P<symbol>[^_]+)_(?P<interval>[^_]+)_(?P<start>\d{4}-\d{2}-\d{2})_(?P<end>\d{4}-\d{2}-\d{2})\.csv$"
+    match = re.match(pattern, filename)
+    return match.groupdict() if match else None
+
+
+def fetch_to_file_with_resume(
+    symbol: str, interval: str, fromdate: datetime, todate: datetime, target_path: str
+):
+    global all_klines, filepath
+
+    all_klines = []
+    filepath = target_path
+    end_ms = datetime_to_ms(todate)
+
+    if os.path.exists(target_path):
+        df = pd.read_csv(target_path)
+        if not df.empty and "time" in df.columns:
+            df["time"] = pd.to_datetime(df["time"])
+            last_time_dt = df["time"].max()
+            current_time_ms = datetime_to_ms(last_time_dt) + interval_to_ms(interval)
+            df["time"] = df["time"].astype("int64") // 10**6
+            all_klines = df.to_dict("records")
+            msg = (
+                f"[RESUME PART] Продолжаем докачку из {os.path.basename(target_path)} "
+                f"с {last_time_dt}"
+            )
+            print(f"{Color.CYAN}{msg}{Color.RESET}")
+            write_log(msg)
+        else:
+            current_time_ms = datetime_to_ms(fromdate)
+    else:
+        current_time_ms = datetime_to_ms(fromdate)
+
+    while current_time_ms < end_ms and not interrupted:
+        try:
+            chunk = fetch_klines(symbol, interval, current_time_ms)
+        except Exception as e:
+            msg = f"[ERROR] Ошибка сети: {e}, жду 10 сек..."
+            print(f"{Color.YELLOW}{msg}{Color.RESET}")
+            write_log(msg)
+            time.sleep(10)
+            continue
+
+        if not chunk:
+            break
+
+        all_klines.extend(chunk)
+
+        if len(all_klines) % 5000 < 1000:
+            save_progress()
+
+        prev_time_ms = current_time_ms
+        last_open_ms = int(chunk[0]["time"])
+        current_time_ms = last_open_ms + interval_to_ms(interval)
+        if current_time_ms <= prev_time_ms:
+            write_log("[ERROR] Некорректный шаг времени от API, останавливаю докачку.")
+            break
+
+        print(
+            f"{Color.CYAN}Докачано {len(all_klines)} свечей в {os.path.basename(target_path)}, до {ms_to_datetime(last_open_ms)}{Color.RESET}"
+        )
+
+        if len(chunk) < 1000:
+            break
+
+        time.sleep(0.5)
+
+    save_progress()
+    return not interrupted
+
+
+def update_existing_files():
+    global logfilepath
+
+    modpath = os.path.dirname(os.path.abspath(__file__))
+    downloads_path = os.path.join(modpath, "downloads")
+    today = datetime.now().date()
+
+    if not os.path.exists(downloads_path):
+        print(f"{Color.YELLOW}Папка downloads не найдена: {downloads_path}{Color.RESET}")
+        return
+
+    csv_files = sorted(f for f in os.listdir(downloads_path) if f.lower().endswith(".csv"))
+    if not csv_files:
+        print(f"{Color.YELLOW}В downloads нет CSV файлов для обновления.{Color.RESET}")
+        return
+
+    for filename in csv_files:
+        parsed = parse_download_filename(filename)
+        if not parsed:
+            continue
+
+        symbol = parsed["symbol"]
+        interval = parsed["interval"]
+        file_start = parsed["start"]
+        csv_path = os.path.join(downloads_path, filename)
+        logfilepath = get_filepath(filename.replace(".csv", ".log"))
+
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"{Color.RED}Не удалось прочитать {filename}: {e}{Color.RESET}")
+            continue
+
+        if df.empty or "time" not in df.columns:
+            print(
+                f"{Color.YELLOW}Пропускаю {filename}: файл пустой или нет колонки time.{Color.RESET}"
+            )
+            continue
+
+        df["time"] = pd.to_datetime(df["time"])
+        last_time = df["time"].max()
+        last_date = last_time.date()
+
+        if last_date >= today:
+            print(f"{Color.GREEN}{filename}: уже актуален ({last_date}).{Color.RESET}")
+            continue
+
+        from_dt = last_time + timedelta(milliseconds=interval_to_ms(interval))
+        end_dt = datetime.now()
+        if from_dt >= end_dt:
+            print(f"{Color.GREEN}{filename}: уже актуален ({last_date}).{Color.RESET}")
+            continue
+
+        part_filename = f"{symbol}_{interval}_{parsed['end']}_update.part.csv"
+        part_csv_path = os.path.join(downloads_path, part_filename)
+        part_log_path = os.path.join(downloads_path, part_filename.replace(".csv", ".log"))
+        logfilepath = part_log_path
+        msg = (
+            f"[UPDATE START] {filename}: отдельная докачка в {part_filename} "
+            f"с {from_dt.strftime('%Y-%m-%d %H:%M:%S')} до {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        print(f"{Color.CYAN}{msg}{Color.RESET}")
+        write_log(msg)
+
+        completed = fetch_to_file_with_resume(
+            symbol=symbol,
+            interval=interval,
+            fromdate=from_dt,
+            todate=end_dt,
+            target_path=part_csv_path,
+        )
+        if not completed:
+            print(
+                f"{Color.YELLOW}Докачка прервана, прогресс сохранён в {part_filename}. Повторный запуск продолжит с этого места.{Color.RESET}"
+            )
+            return
+
+        if not os.path.exists(part_csv_path):
+            print(f"{Color.YELLOW}{filename}: файл докачки не создан, пропускаю.{Color.RESET}")
+            continue
+
+        part_df = pd.read_csv(part_csv_path)
+        if part_df.empty or "time" not in part_df.columns:
+            print(f"{Color.YELLOW}{filename}: новых данных не получено.{Color.RESET}")
+            continue
+
+        part_df["time"] = pd.to_datetime(part_df["time"])
+        merged = pd.concat([df, part_df], ignore_index=True)
+        merged.sort_values(by="time", inplace=True)
+        merged.drop_duplicates(subset="time", inplace=True)
+
+        new_last_time = merged["time"].max()
+        new_end = new_last_time.strftime("%Y-%m-%d")
+        new_filename = f"{symbol}_{interval}_{file_start}_{new_end}.csv"
+        new_logfilename = new_filename.replace(".csv", ".log")
+        new_csv_path = os.path.join(downloads_path, new_filename)
+        new_log_path = os.path.join(downloads_path, new_logfilename)
+
+        merged.to_csv(new_csv_path, index=False)
+
+        if filename != new_filename and os.path.exists(csv_path):
+            os.remove(csv_path)
+
+        if os.path.exists(part_log_path):
+            if os.path.exists(new_log_path):
+                with open(part_log_path, "r", encoding="utf-8") as src, open(
+                    new_log_path, "a", encoding="utf-8"
+                ) as dst:
+                    dst.write(src.read())
+                os.remove(part_log_path)
+            else:
+                os.replace(part_log_path, new_log_path)
+        if os.path.exists(part_csv_path):
+            os.remove(part_csv_path)
+
+        logfilepath = new_log_path
+        write_log(
+            f"[UPDATE END] Обновлён файл {new_filename}. Всего свечей: {len(merged)}, последняя: {new_last_time}."
+        )
+        print(
+            f"{Color.GREEN}✅ Обновлён: {new_filename}, свечей: {len(merged)}, до {new_last_time}{Color.RESET}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="""Скачивание исторических данных свечей с BingX API.
@@ -277,7 +476,20 @@ def main():
     parser.add_argument(
         "--todate", type=valid_date, help="Дата конца периода YYYY-MM-DD"
     )
+    parser.add_argument(
+        "--update-existing",
+        action="store_true",
+        help="Обновить все существующие CSV в downloads до текущей даты",
+    )
     args = parser.parse_args()
+
+    if args.update_existing:
+        if args.lastdays or args.fromdate or args.todate:
+            raise ValueError(
+                "С флагом --update-existing нельзя использовать --lastdays, --fromdate и --todate."
+            )
+        update_existing_files()
+        return
 
     # Проверка конфликтов
     if args.lastdays and (args.fromdate or args.todate):
