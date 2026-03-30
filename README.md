@@ -25,12 +25,27 @@ CLI utility for downloading historical candlestick (kline) data from BingX and s
 
 ## Installation
 
+Choose the setup that matches your workflow.
+
+Regular installation:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -e .
 ```
+
+Development installation:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e '.[dev]'
+```
+
+The development setup includes test and build dependencies such as `pytest`, `setuptools`, and `wheel`.
 
 Optional `.env` file:
 
