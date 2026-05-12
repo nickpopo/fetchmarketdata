@@ -12,7 +12,12 @@ from typing import Optional
 
 load_dotenv()
 
-API_URL = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
+API_BASE_URL = "https://open-api.bingx.com/openApi"
+API_URLS = {
+    "swap": f"{API_BASE_URL}/swap/v3/quote/klines",
+    "spot": f"{API_BASE_URL}/spot/v2/market/kline",
+}
+SPOT_MAX_QUERY_RANGE_MS = 7 * 24 * 60 * 60 * 1000
 API_KEY = os.getenv("API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 
@@ -21,11 +26,57 @@ HEADERS = {
 }
 
 # ======== HELPERS =======
-def get_filepath(filename):
-    MODPATH = os.path.dirname(os.path.abspath(__file__))
-    downloads_path = os.path.join(MODPATH, "downloads")
+def get_downloads_path(market: str):
+    modpath = os.path.dirname(os.path.abspath(__file__))
+    downloads_path = os.path.join(modpath, "downloads", market)
     os.makedirs(downloads_path, exist_ok=True)
-    return os.path.join(downloads_path, filename)
+    return downloads_path
+
+
+def get_filepath(filename: str, market: str):
+    return os.path.join(get_downloads_path(market), filename)
+
+
+def build_data_filename(symbol: str, interval: str, fromdate: datetime, todate: datetime, market: str):
+    return (
+        f"{symbol}_{interval}_{fromdate.strftime('%Y-%m-%d')}_{todate.strftime('%Y-%m-%d')}_{market}.csv"
+    )
+
+
+def build_part_filename(symbol: str, interval: str, end_date: str, market: str):
+    return f"{symbol}_{interval}_{end_date}_update_{market}.part.csv"
+
+
+def get_api_url(market: str) -> str:
+    try:
+        return API_URLS[market]
+    except KeyError as exc:
+        raise ValueError(f"Unknown market: {market}") from exc
+
+
+def normalize_kline(market: str, raw_kline):
+    if isinstance(raw_kline, dict):
+        return raw_kline
+
+    if market == "spot" and isinstance(raw_kline, (list, tuple)) and len(raw_kline) >= 6:
+        return {
+            "time": raw_kline[0],
+            "open": raw_kline[1],
+            "high": raw_kline[2],
+            "low": raw_kline[3],
+            "close": raw_kline[4],
+            "volume": raw_kline[5],
+            "closeTime": raw_kline[6] if len(raw_kline) > 6 else None,
+            "quoteVolume": raw_kline[7] if len(raw_kline) > 7 else None,
+        }
+
+    raise ValueError(f"Unsupported kline format for market {market}: {raw_kline}")
+
+
+def normalize_klines(market: str, raw_klines):
+    normalized = [normalize_kline(market, item) for item in raw_klines]
+    normalized.sort(key=lambda item: int(item["time"]))
+    return normalized
 
 
 def datetime_to_ms(foo):
@@ -81,7 +132,63 @@ def interval_to_ms(interval: str) -> int:
     raise ValueError(f"Unknown interval: {interval}")
 
 
+def get_request_end_ms(
+    market: str,
+    interval: str,
+    start_ms: int,
+    final_end_ms: int,
+    limit: int,
+) -> int:
+    interval_ms = interval_to_ms(interval)
+    max_by_limit = start_ms + (limit * interval_ms) - interval_ms
+    end_candidates = [final_end_ms, max_by_limit]
+
+    if market == "spot":
+        max_by_market = start_ms + SPOT_MAX_QUERY_RANGE_MS - interval_ms
+        end_candidates.append(max_by_market)
+
+    return min(end_candidates)
+
+
+def is_spot_range_error(error: Exception) -> bool:
+    return "maximum query range" in str(error).lower()
+
+
+def fetch_klines_with_adaptive_range(
+    market: str,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    final_end_ms: int,
+    limit: int = 1400,
+):
+    request_end_ms = get_request_end_ms(
+        market=market,
+        interval=interval,
+        start_ms=start_ms,
+        final_end_ms=final_end_ms,
+        limit=limit,
+    )
+    interval_ms = interval_to_ms(interval)
+
+    while True:
+        try:
+            return fetch_klines(market, symbol, interval, start_ms, request_end_ms, limit), request_end_ms
+        except ValueError as exc:
+            if market != "spot" or not is_spot_range_error(exc):
+                raise
+
+            next_end_ms = start_ms + max(((request_end_ms - start_ms) // 2), interval_ms)
+            next_end_ms = max(start_ms + interval_ms, next_end_ms)
+
+            if next_end_ms >= request_end_ms:
+                raise
+
+            request_end_ms = next_end_ms
+
+
 def fetch_klines(
+    market: str,
     symbol: str,
     interval: str,
     start_ms: Optional[int] = None,
@@ -100,14 +207,14 @@ def fetch_klines(
     if end_ms is not None:
         params["endTime"] = end_ms
 
-    resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=10)
+    resp = requests.get(get_api_url(market), params=params, headers=HEADERS, timeout=10)
     resp.raise_for_status()
 
     data = resp.json()
     if data.get("code") and data["code"] != 0:
         raise ValueError(f"API error: {data.get('msg')}")
 
-    return data["data"]
+    return normalize_klines(market, data["data"])
 
 
 def write_log(msg: str):
@@ -165,7 +272,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-def fetch_and_save(symbol="ETH-USDT", interval="5m", fromdate=None, todate=None):
+def fetch_and_save(market="swap", symbol="ETH-USDT", interval="5m", fromdate=None, todate=None):
     global all_klines, filepath, logfilepath
 
     if todate is None:
@@ -174,14 +281,15 @@ def fetch_and_save(symbol="ETH-USDT", interval="5m", fromdate=None, todate=None)
     if fromdate is None:
         fromdate = todate - timedelta(days=60)
 
-    filename = f"{symbol}_{interval}_{fromdate.strftime('%Y-%m-%d')}_{todate.strftime('%Y-%m-%d')}.csv"
+    filename = build_data_filename(symbol, interval, fromdate, todate, market)
     logfilename = filename.replace(".csv", ".log")
-    filepath = get_filepath(filename)
-    logfilepath = get_filepath(logfilename)
+    filepath = get_filepath(filename, market)
+    logfilepath = get_filepath(logfilename, market)
 
     # Логируем старт
     log_start_msg = (
         f"[START] Запуск скрипта с параметрами:\n"
+        f"  market = {market}\n"
         f"  symbol = {symbol}\n"
         f"  interval = {interval}\n"
         f"  from_date = {fromdate.strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -218,7 +326,14 @@ def fetch_and_save(symbol="ETH-USDT", interval="5m", fromdate=None, todate=None)
     # Основной цикл загрузки
     while current_time_ms < end_ms and not interrupted:
         try:
-            chunk = fetch_klines(symbol, interval, current_time_ms)
+            chunk, request_end_ms = fetch_klines_with_adaptive_range(
+                market=market,
+                symbol=symbol,
+                interval=interval,
+                start_ms=current_time_ms,
+                final_end_ms=end_ms,
+                limit=1400,
+            )
         except Exception as e:
             msg = f"[ERROR] Ошибка сети: {e}, жду 10 сек..."
             print(f"{Color.YELLOW}{msg}{Color.RESET}")
@@ -234,7 +349,7 @@ def fetch_and_save(symbol="ETH-USDT", interval="5m", fromdate=None, todate=None)
         if len(all_klines) % 5000 < 1000:
             save_progress()
 
-        last_open_ms = chunk[0]["time"]
+        last_open_ms = chunk[-1]["time"]
         current_time_ms = int(last_open_ms) + interval_to_ms(interval)
 
         print(
@@ -263,13 +378,16 @@ def valid_date(date_str):
 
 
 def parse_download_filename(filename: str):
-    pattern = r"^(?P<symbol>[^_]+)_(?P<interval>[^_]+)_(?P<start>\d{4}-\d{2}-\d{2})_(?P<end>\d{4}-\d{2}-\d{2})\.csv$"
+    pattern = (
+        r"^(?P<symbol>[^_]+)_(?P<interval>[^_]+)_(?P<start>\d{4}-\d{2}-\d{2})_"
+        r"(?P<end>\d{4}-\d{2}-\d{2})_(?P<market>swap|spot)\.csv$"
+    )
     match = re.match(pattern, filename)
     return match.groupdict() if match else None
 
 
 def fetch_to_file_with_resume(
-    symbol: str, interval: str, fromdate: datetime, todate: datetime, target_path: str
+    market: str, symbol: str, interval: str, fromdate: datetime, todate: datetime, target_path: str
 ):
     local_klines = []
     local_log_path = (
@@ -300,7 +418,14 @@ def fetch_to_file_with_resume(
 
     while current_time_ms < end_ms and not interrupted:
         try:
-            chunk = fetch_klines(symbol, interval, current_time_ms)
+            chunk, request_end_ms = fetch_klines_with_adaptive_range(
+                market=market,
+                symbol=symbol,
+                interval=interval,
+                start_ms=current_time_ms,
+                final_end_ms=end_ms,
+                limit=1400,
+            )
         except Exception as e:
             msg = f"[ERROR] Ошибка сети: {e}, жду 10 сек..."
             print(f"{Color.YELLOW}{msg}{Color.RESET}")
@@ -317,7 +442,7 @@ def fetch_to_file_with_resume(
             save_klines_progress(local_klines, target_path, local_log_path)
 
         prev_time_ms = current_time_ms
-        last_open_ms = int(chunk[0]["time"])
+        last_open_ms = int(chunk[-1]["time"])
         current_time_ms = last_open_ms + interval_to_ms(interval)
         if current_time_ms <= prev_time_ms:
             write_log_to(
@@ -346,6 +471,7 @@ def _build_update_task(downloads_path: str, filename: str, today):
 
     symbol = parsed["symbol"]
     interval = parsed["interval"]
+    market = parsed["market"]
     csv_path = os.path.join(downloads_path, filename)
 
     try:
@@ -377,6 +503,7 @@ def _build_update_task(downloads_path: str, filename: str, today):
         "downloads_path": downloads_path,
         "filename": filename,
         "parsed": parsed,
+        "market": market,
         "symbol": symbol,
         "interval": interval,
         "file_start": parsed["start"],
@@ -389,6 +516,7 @@ def _build_update_task(downloads_path: str, filename: str, today):
 
 def _update_existing_file_task(task):
     filename = task["filename"]
+    market = task["market"]
     symbol = task["symbol"]
     interval = task["interval"]
     file_start = task["file_start"]
@@ -398,7 +526,7 @@ def _update_existing_file_task(task):
     parsed = task["parsed"]
     downloads_path = task["downloads_path"]
 
-    part_filename = f"{symbol}_{interval}_{parsed['end']}_update.part.csv"
+    part_filename = build_part_filename(symbol, interval, parsed["end"], market)
     part_csv_path = os.path.join(downloads_path, part_filename)
     part_log_path = os.path.join(downloads_path, part_filename.replace(".csv", ".log"))
     msg = (
@@ -411,6 +539,7 @@ def _update_existing_file_task(task):
     completed = fetch_to_file_with_resume(
         symbol=symbol,
         interval=interval,
+        market=market,
         fromdate=from_dt,
         todate=end_dt,
         target_path=part_csv_path,
@@ -441,7 +570,13 @@ def _update_existing_file_task(task):
 
     new_last_time = merged["time"].max()
     new_end = new_last_time.strftime("%Y-%m-%d")
-    new_filename = f"{symbol}_{interval}_{file_start}_{new_end}.csv"
+    new_filename = build_data_filename(
+        symbol=symbol,
+        interval=interval,
+        fromdate=datetime.strptime(file_start, "%Y-%m-%d"),
+        todate=datetime.strptime(new_end, "%Y-%m-%d"),
+        market=market,
+    )
     new_logfilename = new_filename.replace(".csv", ".log")
     new_csv_path = os.path.join(downloads_path, new_filename)
     new_log_path = os.path.join(downloads_path, new_logfilename)
@@ -473,14 +608,11 @@ def _update_existing_file_task(task):
     return {"status": "updated", "filename": filename}
 
 
-def update_existing_files(multithreading: bool = True):
-
-    modpath = os.path.dirname(os.path.abspath(__file__))
-    downloads_path = os.path.join(modpath, "downloads")
+def _update_existing_files_in_dir(downloads_path: str, multithreading: bool = True):
     today = datetime.now().date()
 
     if not os.path.exists(downloads_path):
-        print(f"{Color.YELLOW}Папка downloads не найдена: {downloads_path}{Color.RESET}")
+        print(f"{Color.YELLOW}Папка не найдена: {downloads_path}{Color.RESET}")
         return
 
     csv_files = sorted(f for f in os.listdir(downloads_path) if f.lower().endswith(".csv"))
@@ -519,6 +651,15 @@ def update_existing_files(multithreading: bool = True):
                 return
 
 
+def update_existing_files(multithreading: bool = True, market: Optional[str] = None):
+    if market:
+        _update_existing_files_in_dir(get_downloads_path(market), multithreading=multithreading)
+        return
+
+    for market_name in API_URLS:
+        _update_existing_files_in_dir(get_downloads_path(market_name), multithreading=multithreading)
+
+
 def main():
     global write_log_enabled
 
@@ -529,11 +670,22 @@ def main():
    python bingx_fetch.py
 2. С конкретной парой и интервалом:
    python bingx_fetch.py --symbol BTC-USDT --interval 1h
+2a. Для spot рынка:
+   python bingx_fetch.py --market spot --symbol BTC-USDT --interval 1h
+2b. Обновить все рынки сразу:
+   python bingx_fetch.py --update-existing
 3. За последние N дней:
    python bingx_fetch.py --symbol ETH-USDT --interval 5m --lastdays 90
 4. За конкретный период:
    python bingx_fetch.py --symbol ETH-USDT --interval 5m --fromdate 2025-07-01 --todate 2025-08-01
 """
+    )
+    parser.add_argument(
+        "--market",
+        type=str,
+        choices=sorted(API_URLS.keys()),
+        default=None,
+        help="Рынок для загрузки: swap или spot. Для --update-existing без параметра будут обновлены оба рынка",
     )
     parser.add_argument(
         "--symbol",
@@ -579,7 +731,7 @@ def main():
             raise ValueError(
                 "С флагом --update-existing нельзя использовать --lastdays, --fromdate и --todate."
             )
-        update_existing_files(multithreading=not args.no_multithreading)
+        update_existing_files(multithreading=not args.no_multithreading, market=args.market)
         return
 
     # Проверка конфликтов
@@ -613,7 +765,11 @@ def main():
         fromdate = todate - timedelta(days=60)
 
     fetch_and_save(
-        symbol=args.symbol, interval=args.interval, fromdate=fromdate, todate=todate
+        market=args.market or "swap",
+        symbol=args.symbol,
+        interval=args.interval,
+        fromdate=fromdate,
+        todate=todate,
     )
 
 

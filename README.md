@@ -4,16 +4,16 @@ CLI utility for downloading historical candlestick (kline) data from BingX and s
 
 ## Features
 
-- Downloads historical candles for a selected trading pair and interval through the BingX API.
+- Downloads historical candles for a selected trading pair, interval, and market (`swap` or `spot`) through the BingX API.
 - Supports flexible date ranges:
   - recent period via `--lastdays`
   - explicit range via `--fromdate` and `--todate`
   - default mode: last 60 days for `ETH-USDT` on `5m`
 - Resumes downloads into an existing CSV file instead of starting from scratch.
-- Saves output into a local `downloads/` directory next to the script.
+- Saves output into market-specific directories under `downloads/` next to the script.
 - Optionally writes execution logs to a `.log` file with `--write-log`.
 - Handles interruption (`Ctrl+C`) and saves progress before exit.
-- Can update all existing CSV files in `downloads/` up to the current time with `--update-existing`.
+- Can update all existing CSV files in `downloads/swap/` or `downloads/spot/` up to the current time with `--update-existing`.
 - Uses multithreading by default when updating multiple existing files.
 - Stores partial update progress in `*.part.csv` files so interrupted update jobs can continue later.
 - Merges newly downloaded data with existing files, sorts by timestamp, and removes duplicate candles.
@@ -70,6 +70,8 @@ python bingx_fetch.py
 
 - `--symbol` trading pair, for example `BTC-USDT`
 - `--interval` candle interval
+- `--market` market type: `swap` or `spot`
+  For regular downloads the default is `swap`; with `--update-existing` and no `--market`, both markets are updated
 - `--lastdays` download the last N days
 - `--fromdate` start date in `YYYY-MM-DD`
 - `--todate` end date in `YYYY-MM-DD`
@@ -90,6 +92,9 @@ bingx-fetch
 # Custom symbol and interval
 bingx-fetch --symbol BTC-USDT --interval 1h
 
+# Download spot market data
+bingx-fetch --market spot --symbol BTC-USDT --interval 1h
+
 # Download the last 90 days
 bingx-fetch --symbol ETH-USDT --interval 5m --lastdays 90
 
@@ -99,8 +104,11 @@ bingx-fetch --symbol ETH-USDT --interval 5m --fromdate 2025-07-01 --todate 2025-
 # Write a log file alongside the CSV
 bingx-fetch --symbol BTC-USDT --interval 1m --lastdays 7 --write-log
 
-# Update all previously downloaded CSV files
+# Update all previously downloaded CSV files for both markets
 bingx-fetch --update-existing --write-log
+
+# Update all previously downloaded spot CSV files
+bingx-fetch --market spot --update-existing --write-log
 
 # Update existing files sequentially
 bingx-fetch --update-existing --no-multithreading
@@ -110,13 +118,13 @@ bingx-fetch --update-existing --no-multithreading
 
 Regular downloads produce:
 
-- `downloads/<symbol>_<interval>_<from>_<to>.csv`
-- `downloads/<symbol>_<interval>_<from>_<to>.log` when `--write-log` is enabled
+- `downloads/<market>/<symbol>_<interval>_<from>_<to>_<market>.csv`
+- `downloads/<market>/<symbol>_<interval>_<from>_<to>_<market>.log` when `--write-log` is enabled
 
 Update mode may also create temporary files during incremental refresh:
 
-- `downloads/<symbol>_<interval>_<old_end>_update.part.csv`
-- `downloads/<symbol>_<interval>_<old_end>_update.part.log`
+- `downloads/<market>/<symbol>_<interval>_<old_end>_update_<market>.part.csv`
+- `downloads/<market>/<symbol>_<interval>_<old_end>_update_<market>.part.log`
 
 If an update completes successfully, the tool merges the old and new data into a refreshed CSV whose end date matches the latest candle, then removes the temporary part files.
 

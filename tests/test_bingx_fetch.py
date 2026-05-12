@@ -16,7 +16,8 @@ def _write_csv(path, rows):
 
 def _prepare_module_state(monkeypatch, tmp_path):
     downloads = tmp_path / "downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
+    (downloads / "swap").mkdir(parents=True, exist_ok=True)
+    (downloads / "spot").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(bingx_fetch, "__file__", str(tmp_path / "bingx_fetch.py"), raising=False)
     monkeypatch.setattr(bingx_fetch, "all_klines", [])
     monkeypatch.setattr(bingx_fetch, "filepath", None)
@@ -29,10 +30,10 @@ def _prepare_module_state(monkeypatch, tmp_path):
 def test_get_filepath_creates_downloads_directory(monkeypatch, tmp_path):
     _prepare_module_state(monkeypatch, tmp_path)
 
-    path = bingx_fetch.get_filepath("sample.csv")
+    path = bingx_fetch.get_filepath("sample.csv", "swap")
 
-    assert path == str(tmp_path / "downloads" / "sample.csv")
-    assert (tmp_path / "downloads").is_dir()
+    assert path == str(tmp_path / "downloads" / "swap" / "sample.csv")
+    assert (tmp_path / "downloads" / "swap").is_dir()
 
 
 def test_datetime_helpers_convert_values():
@@ -54,6 +55,45 @@ def test_interval_to_ms_supports_known_values_and_rejects_unknown():
         bingx_fetch.interval_to_ms("10m")
 
 
+def test_get_request_end_ms_respects_limit_and_spot_window():
+    start_ms = bingx_fetch.datetime_to_ms(datetime(2025, 1, 1, 0, 0, 0))
+    final_end_ms = bingx_fetch.datetime_to_ms(datetime(2025, 2, 1, 0, 0, 0))
+
+    swap_end_ms = bingx_fetch.get_request_end_ms("swap", "1m", start_ms, final_end_ms, 1400)
+    spot_end_ms = bingx_fetch.get_request_end_ms("spot", "1m", start_ms, final_end_ms, 20_000)
+
+    assert swap_end_ms == start_ms + (1400 * 60_000) - 60_000
+    assert spot_end_ms == start_ms + bingx_fetch.SPOT_MAX_QUERY_RANGE_MS - 60_000
+
+
+def test_fetch_klines_with_adaptive_range_retries_spot_with_smaller_window(monkeypatch):
+    start_ms = bingx_fetch.datetime_to_ms(datetime(2025, 1, 1, 0, 0, 0))
+    final_end_ms = bingx_fetch.datetime_to_ms(datetime(2025, 1, 10, 0, 0, 0))
+    seen_end_times = []
+
+    def fake_fetch_klines(market, symbol, interval, passed_start_ms, end_ms=None, limit=1400):
+        seen_end_times.append(end_ms)
+        if len(seen_end_times) == 1:
+            raise ValueError("API error: The maximum query range for FARTCOIN_USDT K-lines is 7 days and 0 hours.")
+        return [{"time": passed_start_ms}]
+
+    monkeypatch.setattr(bingx_fetch, "fetch_klines", fake_fetch_klines)
+
+    chunk, used_end_ms = bingx_fetch.fetch_klines_with_adaptive_range(
+        market="spot",
+        symbol="FARTCOIN-USDT",
+        interval="1d",
+        start_ms=start_ms,
+        final_end_ms=final_end_ms,
+        limit=1400,
+    )
+
+    assert chunk == [{"time": start_ms}]
+    assert len(seen_end_times) == 2
+    assert used_end_ms == seen_end_times[-1]
+    assert seen_end_times[-1] < seen_end_times[0]
+
+
 def test_fetch_klines_sends_expected_request(monkeypatch):
     captured = {}
 
@@ -73,11 +113,11 @@ def test_fetch_klines_sends_expected_request(monkeypatch):
 
     monkeypatch.setattr(bingx_fetch.requests, "get", fake_get)
 
-    data = bingx_fetch.fetch_klines("BTC-USDT", "1m", start_ms=1000, end_ms=2000, limit=500)
+    data = bingx_fetch.fetch_klines("swap", "BTC-USDT", "1m", start_ms=1000, end_ms=2000, limit=500)
 
     assert data == [{"time": 1}]
     assert captured == {
-        "url": bingx_fetch.API_URL,
+        "url": bingx_fetch.API_URLS["swap"],
         "params": {
             "symbol": "BTC-USDT",
             "interval": "1m",
@@ -88,6 +128,52 @@ def test_fetch_klines_sends_expected_request(monkeypatch):
         "headers": bingx_fetch.HEADERS,
         "timeout": 10,
     }
+
+
+def test_fetch_klines_normalizes_spot_array_response(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "code": 0,
+                "data": [
+                    [1702720620000, 42216.29, 42216.94, 42216.29, 42216.72, 0.2, 1702720679999, 8548.46],
+                    [1702720560000, 42220.61, 42221.1, 42215.56, 42216.63, 2.93, 1702720619999, 123968.7],
+                ],
+            }
+
+    monkeypatch.setattr(
+        bingx_fetch.requests,
+        "get",
+        lambda url, params, headers, timeout: FakeResponse(),
+    )
+
+    data = bingx_fetch.fetch_klines("spot", "BTC-USDT", "1m", start_ms=1000, end_ms=2000, limit=500)
+
+    assert data == [
+        {
+            "time": 1702720560000,
+            "open": 42220.61,
+            "high": 42221.1,
+            "low": 42215.56,
+            "close": 42216.63,
+            "volume": 2.93,
+            "closeTime": 1702720619999,
+            "quoteVolume": 123968.7,
+        },
+        {
+            "time": 1702720620000,
+            "open": 42216.29,
+            "high": 42216.94,
+            "low": 42216.29,
+            "close": 42216.72,
+            "volume": 0.2,
+            "closeTime": 1702720679999,
+            "quoteVolume": 8548.46,
+        },
+    ]
 
 
 def test_fetch_klines_raises_on_api_error(monkeypatch):
@@ -105,7 +191,15 @@ def test_fetch_klines_raises_on_api_error(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="API error: boom"):
-        bingx_fetch.fetch_klines("BTC-USDT", "1m")
+        bingx_fetch.fetch_klines("swap", "BTC-USDT", "1m")
+
+
+def test_get_api_url_supports_known_markets():
+    assert bingx_fetch.get_api_url("swap") == bingx_fetch.API_URLS["swap"]
+    assert bingx_fetch.get_api_url("spot") == bingx_fetch.API_URLS["spot"]
+
+    with pytest.raises(ValueError, match="Unknown market: futures"):
+        bingx_fetch.get_api_url("futures")
 
 
 def test_write_log_appends_when_enabled(monkeypatch, tmp_path):
@@ -214,11 +308,12 @@ def test_valid_date_parses_and_rejects_invalid():
 
 
 def test_parse_download_filename_handles_valid_and_invalid_names():
-    assert bingx_fetch.parse_download_filename("BTC-USDT_1m_2020-01-01_2020-01-02.csv") == {
+    assert bingx_fetch.parse_download_filename("BTC-USDT_1m_2020-01-01_2020-01-02_swap.csv") == {
         "symbol": "BTC-USDT",
         "interval": "1m",
         "start": "2020-01-01",
         "end": "2020-01-02",
+        "market": "swap",
     }
     assert bingx_fetch.parse_download_filename("broken.csv") is None
 
@@ -230,8 +325,8 @@ def test_fetch_and_save_downloads_new_file(monkeypatch, tmp_path):
     calls = []
     sleeps = []
 
-    def fake_fetch(symbol, interval, start_ms, end_ms=None, limit=1400):
-        calls.append((symbol, interval, start_ms))
+    def fake_fetch(market, symbol, interval, start_ms, end_ms=None, limit=1400):
+        calls.append((market, symbol, interval, start_ms))
         return [
             {
                 "open": 1,
@@ -246,26 +341,51 @@ def test_fetch_and_save_downloads_new_file(monkeypatch, tmp_path):
     monkeypatch.setattr(bingx_fetch, "fetch_klines", fake_fetch)
     monkeypatch.setattr(bingx_fetch.time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    bingx_fetch.fetch_and_save("BTC-USDT", "1m", from_dt, to_dt)
+    bingx_fetch.fetch_and_save("swap", "BTC-USDT", "1m", from_dt, to_dt)
 
-    csv_path = tmp_path / "downloads" / "BTC-USDT_1m_2020-01-01_2020-01-01.csv"
+    csv_path = tmp_path / "downloads" / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv"
     out = pd.read_csv(csv_path)
-    assert calls == [("BTC-USDT", "1m", 1577836800000)]
+    assert calls == [("swap", "BTC-USDT", "1m", 1577836800000)]
     assert sleeps == []
     assert len(out) == 1
     assert pd.to_datetime(out["time"].iloc[0]) == pd.Timestamp("2020-01-01 00:00:00")
 
 
+def test_fetch_and_save_passes_bounded_end_time_for_spot(monkeypatch, tmp_path):
+    _prepare_module_state(monkeypatch, tmp_path)
+    from_dt = datetime(2020, 1, 1, 0, 0, 0)
+    to_dt = datetime(2020, 1, 20, 0, 0, 0)
+    calls = []
+
+    def fake_fetch(market, symbol, interval, start_ms, end_ms=None, limit=1400):
+        calls.append((market, start_ms, end_ms, limit))
+        return []
+
+    monkeypatch.setattr(bingx_fetch, "fetch_klines", fake_fetch)
+
+    bingx_fetch.fetch_and_save("spot", "BTC-USDT", "1m", from_dt, to_dt)
+
+    assert len(calls) == 1
+    assert calls[0][0] == "spot"
+    assert calls[0][2] == bingx_fetch.get_request_end_ms(
+        "spot",
+        "1m",
+        calls[0][1],
+        bingx_fetch.datetime_to_ms(to_dt),
+        1400,
+    )
+
+
 def test_fetch_and_save_resumes_from_existing_csv(monkeypatch, tmp_path):
     downloads = _prepare_module_state(monkeypatch, tmp_path)
-    csv_path = downloads / "BTC-USDT_1m_2020-01-01_2020-01-01.csv"
+    csv_path = downloads / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv"
     _write_csv(csv_path, [[1, 1, 1, 1, 10, "2020-01-01 00:00:00"]])
 
     from_dt = datetime(2020, 1, 1, 0, 0, 0)
     to_dt = datetime(2020, 1, 1, 0, 3, 0)
     calls = []
 
-    def fake_fetch(symbol, interval, start_ms, end_ms=None, limit=1400):
+    def fake_fetch(market, symbol, interval, start_ms, end_ms=None, limit=1400):
         calls.append(start_ms)
         return [
             {
@@ -281,7 +401,7 @@ def test_fetch_and_save_resumes_from_existing_csv(monkeypatch, tmp_path):
     monkeypatch.setattr(bingx_fetch, "fetch_klines", fake_fetch)
     monkeypatch.setattr(bingx_fetch.time, "sleep", lambda seconds: None)
 
-    bingx_fetch.fetch_and_save("BTC-USDT", "1m", from_dt, to_dt)
+    bingx_fetch.fetch_and_save("swap", "BTC-USDT", "1m", from_dt, to_dt)
 
     assert calls == [1577836860000]
     out = pd.read_csv(csv_path)
@@ -296,7 +416,7 @@ def test_fetch_and_save_retries_after_network_error(monkeypatch, tmp_path):
     calls = {"count": 0}
     sleeps = []
 
-    def fake_fetch(symbol, interval, start_ms, end_ms=None, limit=1400):
+    def fake_fetch(market, symbol, interval, start_ms, end_ms=None, limit=1400):
         calls["count"] += 1
         if calls["count"] == 1:
             raise requests.exceptions.Timeout("timeout")
@@ -316,7 +436,7 @@ def test_fetch_and_save_retries_after_network_error(monkeypatch, tmp_path):
     monkeypatch.setattr(bingx_fetch, "fetch_klines", fake_fetch)
     monkeypatch.setattr(bingx_fetch.time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    bingx_fetch.fetch_and_save("BTC-USDT", "1m", from_dt, to_dt)
+    bingx_fetch.fetch_and_save("swap", "BTC-USDT", "1m", from_dt, to_dt)
 
     assert calls["count"] == 2
     assert sleeps == [10]
@@ -324,7 +444,7 @@ def test_fetch_and_save_retries_after_network_error(monkeypatch, tmp_path):
 
 def test_fetch_to_file_with_resume_stops_on_non_advancing_api_time(monkeypatch, tmp_path):
     _prepare_module_state(monkeypatch, tmp_path)
-    part_path = tmp_path / "downloads" / "BTC-USDT_1m_2020-01-01_update.part.csv"
+    part_path = tmp_path / "downloads" / "swap" / "BTC-USDT_1m_2020-01-01_update_swap.part.csv"
     from_dt = datetime(2020, 1, 1, 0, 0, 0)
     to_dt = datetime(2020, 1, 1, 0, 3, 0)
     logged = []
@@ -332,7 +452,7 @@ def test_fetch_to_file_with_resume_stops_on_non_advancing_api_time(monkeypatch, 
     monkeypatch.setattr(
         bingx_fetch,
         "fetch_klines",
-        lambda symbol, interval, start_ms, end_ms=None, limit=1400: [
+        lambda market, symbol, interval, start_ms, end_ms=None, limit=1400: [
             {
                 "open": 1,
                 "close": 1,
@@ -349,6 +469,7 @@ def test_fetch_to_file_with_resume_stops_on_non_advancing_api_time(monkeypatch, 
     completed = bingx_fetch.fetch_to_file_with_resume(
         symbol="BTC-USDT",
         interval="1m",
+        market="swap",
         fromdate=from_dt,
         todate=to_dt,
         target_path=str(part_path),
@@ -362,7 +483,7 @@ def test_fetch_to_file_with_resume_stops_on_non_advancing_api_time(monkeypatch, 
 
 def test_build_update_task_returns_expected_payload(monkeypatch, tmp_path):
     downloads = _prepare_module_state(monkeypatch, tmp_path)
-    csv_path = downloads / "BTC-USDT_1m_2020-01-01_2020-01-02.csv"
+    csv_path = downloads / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-02_swap.csv"
     _write_csv(csv_path, [[1, 1, 1, 1, 10, "2020-01-02 00:00:00"]])
 
     class FrozenDateTime(datetime):
@@ -373,9 +494,12 @@ def test_build_update_task_returns_expected_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(bingx_fetch, "datetime", FrozenDateTime)
 
     task = bingx_fetch._build_update_task(
-        str(downloads), "BTC-USDT_1m_2020-01-01_2020-01-02.csv", datetime(2020, 1, 3).date()
+        str(downloads / "swap"),
+        "BTC-USDT_1m_2020-01-01_2020-01-02_swap.csv",
+        datetime(2020, 1, 3).date(),
     )
 
+    assert task["market"] == "swap"
     assert task["symbol"] == "BTC-USDT"
     assert task["interval"] == "1m"
     assert task["from_dt"] == datetime(2020, 1, 2, 0, 1, 0)
@@ -384,18 +508,18 @@ def test_build_update_task_returns_expected_payload(monkeypatch, tmp_path):
 
 def test_build_update_task_skips_up_to_date_and_invalid_files(monkeypatch, tmp_path):
     downloads = _prepare_module_state(monkeypatch, tmp_path)
-    valid_name = "BTC-USDT_1m_2020-01-01_2020-01-03.csv"
-    _write_csv(downloads / valid_name, [[1, 1, 1, 1, 10, "2020-01-03 00:00:00"]])
-    (downloads / "broken_name.csv").write_text("time\n2020-01-01 00:00:00\n", encoding="utf-8")
-    (downloads / "ETH-USDT_1m_2020-01-01_2020-01-02.csv").write_text("open\n1\n", encoding="utf-8")
+    valid_name = "BTC-USDT_1m_2020-01-01_2020-01-03_swap.csv"
+    _write_csv(downloads / "swap" / valid_name, [[1, 1, 1, 1, 10, "2020-01-03 00:00:00"]])
+    (downloads / "swap" / "broken_name.csv").write_text("time\n2020-01-01 00:00:00\n", encoding="utf-8")
+    (downloads / "swap" / "ETH-USDT_1m_2020-01-01_2020-01-02_swap.csv").write_text("open\n1\n", encoding="utf-8")
 
     today = datetime(2020, 1, 3).date()
 
-    assert bingx_fetch._build_update_task(str(downloads), valid_name, today) is None
-    assert bingx_fetch._build_update_task(str(downloads), "broken_name.csv", today) is None
+    assert bingx_fetch._build_update_task(str(downloads / "swap"), valid_name, today) is None
+    assert bingx_fetch._build_update_task(str(downloads / "swap"), "broken_name.csv", today) is None
     assert (
         bingx_fetch._build_update_task(
-            str(downloads), "ETH-USDT_1m_2020-01-01_2020-01-02.csv", today
+            str(downloads / "swap"), "ETH-USDT_1m_2020-01-01_2020-01-02_swap.csv", today
         )
         is None
     )
@@ -403,8 +527,8 @@ def test_build_update_task_skips_up_to_date_and_invalid_files(monkeypatch, tmp_p
 
 def test_update_existing_file_task_skips_when_part_file_missing(monkeypatch, tmp_path):
     downloads = _prepare_module_state(monkeypatch, tmp_path)
-    base_name = "BTC-USDT_1m_2020-01-01_2020-01-01.csv"
-    base_path = downloads / base_name
+    base_name = "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv"
+    base_path = downloads / "swap" / base_name
     _write_csv(base_path, [[1, 1, 1, 1, 10, "2020-01-01 00:00:00"]])
 
     monkeypatch.setattr(bingx_fetch, "fetch_to_file_with_resume", lambda **kwargs: True)
@@ -412,6 +536,7 @@ def test_update_existing_file_task_skips_when_part_file_missing(monkeypatch, tmp
     result = bingx_fetch._update_existing_file_task(
         {
             "filename": base_name,
+            "market": "swap",
             "symbol": "BTC-USDT",
             "interval": "1m",
             "file_start": "2020-01-01",
@@ -419,7 +544,7 @@ def test_update_existing_file_task_skips_when_part_file_missing(monkeypatch, tmp
             "from_dt": datetime(2020, 1, 1, 0, 1, 0),
             "end_dt": datetime(2020, 1, 2, 0, 0, 0),
             "parsed": {"end": "2020-01-01"},
-            "downloads_path": str(downloads),
+            "downloads_path": str(downloads / "swap"),
         }
     )
 
@@ -431,14 +556,14 @@ def test_update_existing_file_task_merges_part_log_into_existing_log(monkeypatch
     downloads = _prepare_module_state(monkeypatch, tmp_path)
     monkeypatch.setattr(bingx_fetch, "write_log_enabled", True)
 
-    base_name = "BTC-USDT_1m_2020-01-01_2020-01-01.csv"
-    base_path = downloads / base_name
+    base_name = "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv"
+    base_path = downloads / "swap" / base_name
     _write_csv(base_path, [[1, 1, 1, 1, 10, "2020-01-01 00:00:00"]])
 
-    new_log_path = downloads / "BTC-USDT_1m_2020-01-01_2020-01-02.log"
+    new_log_path = downloads / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-02_swap.log"
     new_log_path.write_text("existing-log\n", encoding="utf-8")
 
-    def fake_fetch_to_file_with_resume(symbol, interval, fromdate, todate, target_path):
+    def fake_fetch_to_file_with_resume(market, symbol, interval, fromdate, todate, target_path):
         _write_csv(target_path, [[2, 2, 2, 2, 20, "2020-01-02 00:00:00"]])
         part_log = target_path.replace(".csv", ".log")
         with open(part_log, "w", encoding="utf-8") as fh:
@@ -450,6 +575,7 @@ def test_update_existing_file_task_merges_part_log_into_existing_log(monkeypatch
     result = bingx_fetch._update_existing_file_task(
         {
             "filename": base_name,
+            "market": "swap",
             "symbol": "BTC-USDT",
             "interval": "1m",
             "file_start": "2020-01-01",
@@ -457,7 +583,7 @@ def test_update_existing_file_task_merges_part_log_into_existing_log(monkeypatch
             "from_dt": datetime(2020, 1, 1, 0, 1, 0),
             "end_dt": datetime(2020, 1, 2, 0, 0, 0),
             "parsed": {"end": "2020-01-01"},
-            "downloads_path": str(downloads),
+            "downloads_path": str(downloads / "swap"),
         }
     )
 
@@ -475,10 +601,10 @@ def test_update_existing_files_returns_when_no_downloads_directory(monkeypatch, 
 
 def test_update_existing_files_handles_worker_exception(monkeypatch, tmp_path):
     downloads = _prepare_module_state(monkeypatch, tmp_path)
-    (downloads / "BTC-USDT_1m_2020-01-01_2020-01-01.csv").write_text(
+    (downloads / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv").write_text(
         "time\n2020-01-01 00:00:00\n", encoding="utf-8"
     )
-    (downloads / "ETH-USDT_1m_2020-01-01_2020-01-01.csv").write_text(
+    (downloads / "swap" / "ETH-USDT_1m_2020-01-01_2020-01-01_swap.csv").write_text(
         "time\n2020-01-01 00:00:00\n", encoding="utf-8"
     )
 
@@ -517,7 +643,7 @@ def test_update_existing_files_handles_worker_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(bingx_fetch, "as_completed", lambda futures: futures)
     monkeypatch.setattr(bingx_fetch.os, "cpu_count", lambda: 4)
 
-    assert bingx_fetch.update_existing_files() is None
+    assert bingx_fetch.update_existing_files(market="swap") is None
 
 
 def test_main_uses_lastdays(monkeypatch):
@@ -533,8 +659,9 @@ def test_main_uses_lastdays(monkeypatch):
     monkeypatch.setattr(
         bingx_fetch,
         "fetch_and_save",
-        lambda symbol, interval, fromdate, todate: called.update(
+        lambda market, symbol, interval, fromdate, todate: called.update(
             {
+                "market": market,
                 "symbol": symbol,
                 "interval": interval,
                 "fromdate": fromdate,
@@ -547,6 +674,7 @@ def test_main_uses_lastdays(monkeypatch):
     bingx_fetch.main()
 
     assert called == {
+        "market": "swap",
         "symbol": "BTC-USDT",
         "interval": "1h",
         "fromdate": frozen_now - timedelta(days=7),
@@ -567,8 +695,9 @@ def test_main_uses_default_range(monkeypatch):
     monkeypatch.setattr(
         bingx_fetch,
         "fetch_and_save",
-        lambda symbol, interval, fromdate, todate: called.update(
+        lambda market, symbol, interval, fromdate, todate: called.update(
             {
+                "market": market,
                 "symbol": symbol,
                 "interval": interval,
                 "fromdate": fromdate,
@@ -580,6 +709,7 @@ def test_main_uses_default_range(monkeypatch):
 
     bingx_fetch.main()
 
+    assert called["market"] == "swap"
     assert called["symbol"] == "ETH-USDT"
     assert called["interval"] == "5m"
     assert called["todate"] == frozen_now
@@ -591,13 +721,31 @@ def test_main_calls_update_existing(monkeypatch):
     monkeypatch.setattr(
         bingx_fetch,
         "update_existing_files",
-        lambda multithreading: called.update({"multithreading": multithreading}),
+        lambda multithreading, market: called.update(
+            {"multithreading": multithreading, "market": market}
+        ),
     )
     monkeypatch.setattr(sys, "argv", ["bingx-fetch", "--update-existing", "--no-multithreading"])
 
     bingx_fetch.main()
 
-    assert called == {"multithreading": False}
+    assert called == {"multithreading": False, "market": None}
+
+
+def test_main_calls_update_existing_for_specific_market(monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        bingx_fetch,
+        "update_existing_files",
+        lambda multithreading, market: called.update(
+            {"multithreading": multithreading, "market": market}
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["bingx-fetch", "--update-existing", "--market", "spot"])
+
+    bingx_fetch.main()
+
+    assert called == {"multithreading": True, "market": "spot"}
 
 
 def test_main_rejects_conflicting_arguments(monkeypatch):

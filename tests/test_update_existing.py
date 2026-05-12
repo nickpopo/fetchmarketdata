@@ -12,7 +12,8 @@ def _write_csv(path, rows):
 
 def _prepare_downloads(monkeypatch, tmp_path):
     downloads = tmp_path / "downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
+    (downloads / "swap").mkdir(parents=True, exist_ok=True)
+    (downloads / "spot").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(bingx_fetch, "__file__", str(tmp_path / "bingx_fetch.py"), raising=False)
     monkeypatch.setattr(bingx_fetch, "interrupted", False)
     monkeypatch.setattr(bingx_fetch, "all_klines", [])
@@ -24,8 +25,8 @@ def _prepare_downloads(monkeypatch, tmp_path):
 def test_update_existing_merges_into_new_filename(monkeypatch, tmp_path):
     downloads = _prepare_downloads(monkeypatch, tmp_path)
 
-    old_name = "BTC-USDT_1m_2020-01-01_2020-01-01.csv"
-    old_path = downloads / old_name
+    old_name = "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv"
+    old_path = downloads / "swap" / old_name
     _write_csv(
         old_path,
         [
@@ -34,13 +35,14 @@ def test_update_existing_merges_into_new_filename(monkeypatch, tmp_path):
         ],
     )
 
-    def fake_fetch_to_file_with_resume(symbol, interval, fromdate, todate, target_path):
+    def fake_fetch_to_file_with_resume(market, symbol, interval, fromdate, todate, target_path):
+        assert market == "swap"
         assert symbol == "BTC-USDT"
         assert interval == "1m"
         _write_csv(
             target_path,
             [
-                [2, 2, 2, 2, 20, "2020-01-01 00:01:00"],  # duplicate for dedup check
+                [2, 2, 2, 2, 20, "2020-01-01 00:01:00"],
                 [2, 2, 2, 2, 20, "2020-01-02 00:00:00"],
             ],
         )
@@ -48,52 +50,48 @@ def test_update_existing_merges_into_new_filename(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bingx_fetch, "fetch_to_file_with_resume", fake_fetch_to_file_with_resume)
 
-    bingx_fetch.update_existing_files()
+    bingx_fetch.update_existing_files(market="swap")
 
-    new_path = downloads / "BTC-USDT_1m_2020-01-01_2020-01-02.csv"
+    new_path = downloads / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-02_swap.csv"
     assert new_path.exists()
     assert not old_path.exists()
 
     merged = pd.read_csv(new_path)
     assert len(merged) == 3
     assert merged["time"].iloc[-1] == "2020-01-02 00:00:00"
-
-    # part file should be deleted after successful merge
-    assert not (downloads / "BTC-USDT_1m_2020-01-01_update.part.csv").exists()
+    assert not (downloads / "swap" / "BTC-USDT_1m_2020-01-01_update_swap.part.csv").exists()
 
 
 def test_update_existing_keeps_part_on_interruption(monkeypatch, tmp_path):
     downloads = _prepare_downloads(monkeypatch, tmp_path)
 
-    old_name = "ETH-USDT_1m_2020-01-01_2020-01-01.csv"
-    old_path = downloads / old_name
+    old_name = "ETH-USDT_1m_2020-01-01_2020-01-01_swap.csv"
+    old_path = downloads / "swap" / old_name
     _write_csv(old_path, [[1, 1, 1, 1, 10, "2020-01-01 00:00:00"]])
 
-    def fake_fetch_to_file_with_resume(symbol, interval, fromdate, todate, target_path):
+    def fake_fetch_to_file_with_resume(market, symbol, interval, fromdate, todate, target_path):
         _write_csv(target_path, [[2, 2, 2, 2, 20, "2020-01-01 00:01:00"]])
         return False
 
     monkeypatch.setattr(bingx_fetch, "fetch_to_file_with_resume", fake_fetch_to_file_with_resume)
 
-    bingx_fetch.update_existing_files()
+    bingx_fetch.update_existing_files(market="swap")
 
-    # Original file must remain unchanged when update was interrupted.
     assert old_path.exists()
-    assert not (downloads / "ETH-USDT_1m_2020-01-01_2020-01-02.csv").exists()
-    assert (downloads / "ETH-USDT_1m_2020-01-01_update.part.csv").exists()
+    assert not (downloads / "swap" / "ETH-USDT_1m_2020-01-01_2020-01-02_swap.csv").exists()
+    assert (downloads / "swap" / "ETH-USDT_1m_2020-01-01_update_swap.part.csv").exists()
 
 
 def test_fetch_to_file_with_resume_continues_from_existing_part(monkeypatch, tmp_path):
     downloads = _prepare_downloads(monkeypatch, tmp_path)
 
-    part_path = downloads / "XRP-USDT_1m_2020-01-01_update.part.csv"
+    part_path = downloads / "swap" / "XRP-USDT_1m_2020-01-01_update_swap.part.csv"
     _write_csv(part_path, [[1, 1, 1, 1, 10, "2020-01-01 00:00:00"]])
 
     calls = []
 
-    def fake_fetch_klines(symbol, interval, start_ms, end_ms=None, limit=1400):
+    def fake_fetch_klines(market, symbol, interval, start_ms, end_ms=None, limit=1400):
         calls.append(start_ms)
-        # One candle is enough to finish because len(chunk) < 1000.
         return [
             {
                 "open": 2,
@@ -111,6 +109,7 @@ def test_fetch_to_file_with_resume_continues_from_existing_part(monkeypatch, tmp
     to_dt = datetime(2020, 1, 1, 0, 3, 0)
 
     completed = bingx_fetch.fetch_to_file_with_resume(
+        market="swap",
         symbol="XRP-USDT",
         interval="1m",
         fromdate=from_dt,
@@ -119,8 +118,6 @@ def test_fetch_to_file_with_resume_continues_from_existing_part(monkeypatch, tmp
     )
 
     assert completed is True
-
-    # Resume must start from the next candle after existing part row.
     expected_start = bingx_fetch.datetime_to_ms(datetime(2020, 1, 1, 0, 1, 0))
     assert calls[0] == expected_start
 
@@ -131,10 +128,10 @@ def test_fetch_to_file_with_resume_continues_from_existing_part(monkeypatch, tmp
 
 def test_update_existing_uses_multithreading_by_default(monkeypatch, tmp_path):
     downloads = _prepare_downloads(monkeypatch, tmp_path)
-    (downloads / "BTC-USDT_1m_2020-01-01_2020-01-01.csv").write_text(
+    (downloads / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv").write_text(
         "time\n2020-01-01 00:00:00\n", encoding="utf-8"
     )
-    (downloads / "ETH-USDT_1m_2020-01-01_2020-01-01.csv").write_text(
+    (downloads / "swap" / "ETH-USDT_1m_2020-01-01_2020-01-01_swap.csv").write_text(
         "time\n2020-01-01 00:00:00\n", encoding="utf-8"
     )
 
@@ -178,23 +175,41 @@ def test_update_existing_uses_multithreading_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr(bingx_fetch, "ThreadPoolExecutor", FakeExecutor)
     monkeypatch.setattr(bingx_fetch, "as_completed", lambda futures: futures)
 
-    bingx_fetch.update_existing_files()
+    bingx_fetch.update_existing_files(market="swap")
 
     assert captured["workers"] == 2
     assert sorted(processed) == sorted(
         [
-            "BTC-USDT_1m_2020-01-01_2020-01-01.csv",
-            "ETH-USDT_1m_2020-01-01_2020-01-01.csv",
+            "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv",
+            "ETH-USDT_1m_2020-01-01_2020-01-01_swap.csv",
         ]
     )
 
 
+def test_update_existing_runs_all_markets_when_market_not_specified(monkeypatch, tmp_path):
+    _prepare_downloads(monkeypatch, tmp_path)
+    called = []
+
+    monkeypatch.setattr(
+        bingx_fetch,
+        "_update_existing_files_in_dir",
+        lambda downloads_path, multithreading=True: called.append(downloads_path),
+    )
+
+    bingx_fetch.update_existing_files()
+
+    assert called == [
+        str(tmp_path / "downloads" / "swap"),
+        str(tmp_path / "downloads" / "spot"),
+    ]
+
+
 def test_update_existing_can_run_sequentially(monkeypatch, tmp_path):
     downloads = _prepare_downloads(monkeypatch, tmp_path)
-    (downloads / "BTC-USDT_1m_2020-01-01_2020-01-01.csv").write_text(
+    (downloads / "swap" / "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv").write_text(
         "time\n2020-01-01 00:00:00\n", encoding="utf-8"
     )
-    (downloads / "ETH-USDT_1m_2020-01-01_2020-01-01.csv").write_text(
+    (downloads / "swap" / "ETH-USDT_1m_2020-01-01_2020-01-01_swap.csv").write_text(
         "time\n2020-01-01 00:00:00\n", encoding="utf-8"
     )
 
@@ -218,11 +233,11 @@ def test_update_existing_can_run_sequentially(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bingx_fetch, "ThreadPoolExecutor", MustNotBeCalled)
 
-    bingx_fetch.update_existing_files(multithreading=False)
+    bingx_fetch.update_existing_files(multithreading=False, market="swap")
 
     assert processed == [
-        "BTC-USDT_1m_2020-01-01_2020-01-01.csv",
-        "ETH-USDT_1m_2020-01-01_2020-01-01.csv",
+        "BTC-USDT_1m_2020-01-01_2020-01-01_swap.csv",
+        "ETH-USDT_1m_2020-01-01_2020-01-01_swap.csv",
     ]
 
 
