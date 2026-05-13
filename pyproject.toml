@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fetchmarketdata"
 version = "0.1.0"
-description = "CLI utility for downloading BingX historical candlestick data"
+description = "CLI utility for downloading historical candlestick data from multiple exchanges"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 bingx-fetch = "bingx_fetch:main"
+fetchmarketdata = "bingx_fetch:main"
 
 [tool.setuptools]
 py-modules = ["bingx_fetch"]

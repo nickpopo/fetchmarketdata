@@ -1,19 +1,21 @@
 # fetchmarketdata
 
-CLI utility for downloading historical candlestick (kline) data from BingX and saving it as CSV files.
+CLI utility for downloading historical candlestick (kline) data and saving it as CSV files.
 
 ## Features
 
-- Downloads historical candles for a selected trading pair, interval, and market (`swap` or `spot`) through the BingX API.
+- Downloads historical candles from multiple sources through a shared abstraction layer.
+- Supports `bingx` and `binance` today, with source-specific logic isolated behind a common interface.
+- Supports `spot` and `swap` markets where the selected source provides them.
 - Supports flexible date ranges:
   - recent period via `--lastdays`
   - explicit range via `--fromdate` and `--todate`
   - default mode: last 60 days for `ETH-USDT` on `5m`
 - Resumes downloads into an existing CSV file instead of starting from scratch.
-- Saves output into market-specific directories under `downloads/` next to the script.
+- Saves output into source- and market-specific directories under `downloads/`.
 - Optionally writes execution logs to a `.log` file with `--write-log`.
 - Handles interruption (`Ctrl+C`) and saves progress before exit.
-- Can update all existing CSV files in `downloads/swap/` or `downloads/spot/` up to the current time with `--update-existing`.
+- Can update all existing CSV files up to the current time with `--update-existing`.
 - Uses multithreading by default when updating multiple existing files.
 - Stores partial update progress in `*.part.csv` files so interrupted update jobs can continue later.
 - Merges newly downloaded data with existing files, sorts by timestamp, and removes duplicate candles.
@@ -21,11 +23,12 @@ CLI utility for downloading historical candlestick (kline) data from BingX and s
 ## Requirements
 
 - Python 3.10+
-- Network access to `https://open-api.bingx.com`
+- Network access to:
+  - `https://open-api.bingx.com`
+  - `https://api.binance.com`
+  - `https://fapi.binance.com`
 
 ## Installation
-
-Choose the setup that matches your workflow.
 
 Regular installation:
 
@@ -45,9 +48,7 @@ pip install -U pip
 pip install -e '.[dev]'
 ```
 
-The development setup includes test and build dependencies such as `pytest`, `setuptools`, and `wheel`.
-
-Optional `.env` file:
+Optional `.env` file for BingX:
 
 ```env
 API_KEY=your_api_key
@@ -56,7 +57,11 @@ SECRET_KEY=your_secret_key
 
 ## Usage
 
-After installation, you can run the tool either through the installed CLI entrypoint or directly:
+After installation, you can run the tool through either CLI entrypoint or directly:
+
+```bash
+fetchmarketdata
+```
 
 ```bash
 bingx-fetch
@@ -68,16 +73,27 @@ python bingx_fetch.py
 
 ## CLI Options
 
+- `--source` data source: `bingx` or `binance`
 - `--symbol` trading pair, for example `BTC-USDT`
 - `--interval` candle interval
-- `--market` market type: `swap` or `spot`
-  For regular downloads the default is `swap`; with `--update-existing` and no `--market`, both markets are updated
+- `--market` market type: `spot` or `swap`
+  If omitted, the source default is used:
+  - `bingx`: `swap`
+  - `binance`: `spot`
 - `--lastdays` download the last N days
 - `--fromdate` start date in `YYYY-MM-DD`
 - `--todate` end date in `YYYY-MM-DD`
 - `--update-existing` update all existing CSV files in `downloads/`
 - `--write-log` write logs to a `.log` file
 - `--no-multithreading` disable multithreaded updates for `--update-existing`
+
+When `--update-existing` is used:
+
+- with `--source`, only that source is updated
+- with `--source` and `--market`, only that source/market is updated
+- without `--source`, all configured sources and their markets are updated
+
+For Binance, symbols such as `BTC-USDT` are automatically converted to `BTCUSDT` for API requests.
 
 Supported intervals in the current implementation:
 
@@ -86,45 +102,48 @@ Supported intervals in the current implementation:
 ## Examples
 
 ```bash
-# Default: ETH-USDT, 5m, last 60 days
-bingx-fetch
+# Default: BingX, ETH-USDT, 5m, last 60 days
+fetchmarketdata
 
-# Custom symbol and interval
-bingx-fetch --symbol BTC-USDT --interval 1h
+# BingX swap data
+fetchmarketdata --source bingx --market swap --symbol BTC-USDT --interval 1h
 
-# Download spot market data
-bingx-fetch --market spot --symbol BTC-USDT --interval 1h
+# Binance spot data
+fetchmarketdata --source binance --market spot --symbol BTC-USDT --interval 1h
+
+# Binance futures/swap data
+fetchmarketdata --source binance --market swap --symbol BTC-USDT --interval 15m
 
 # Download the last 90 days
-bingx-fetch --symbol ETH-USDT --interval 5m --lastdays 90
+fetchmarketdata --source binance --symbol ETH-USDT --interval 5m --lastdays 90
 
 # Download a fixed date range
-bingx-fetch --symbol ETH-USDT --interval 5m --fromdate 2025-07-01 --todate 2025-08-01
+fetchmarketdata --source bingx --symbol ETH-USDT --interval 5m --fromdate 2025-07-01 --todate 2025-08-01
 
 # Write a log file alongside the CSV
-bingx-fetch --symbol BTC-USDT --interval 1m --lastdays 7 --write-log
+fetchmarketdata --source binance --symbol BTC-USDT --interval 1m --lastdays 7 --write-log
 
-# Update all previously downloaded CSV files for both markets
-bingx-fetch --update-existing --write-log
+# Update all previously downloaded CSV files for all configured sources and markets
+fetchmarketdata --update-existing --write-log
 
-# Update all previously downloaded spot CSV files
-bingx-fetch --market spot --update-existing --write-log
+# Update only Binance spot CSV files
+fetchmarketdata --source binance --market spot --update-existing --write-log
 
 # Update existing files sequentially
-bingx-fetch --update-existing --no-multithreading
+fetchmarketdata --update-existing --no-multithreading
 ```
 
 ## Output
 
 Regular downloads produce:
 
-- `downloads/<market>/<symbol>_<interval>_<from>_<to>_<market>.csv`
-- `downloads/<market>/<symbol>_<interval>_<from>_<to>_<market>.log` when `--write-log` is enabled
+- `downloads/<source>/<market>/<symbol>_<interval>_<from>_<to>_<source>_<market>.csv`
+- `downloads/<source>/<market>/<symbol>_<interval>_<from>_<to>_<source>_<market>.log` when `--write-log` is enabled
 
 Update mode may also create temporary files during incremental refresh:
 
-- `downloads/<market>/<symbol>_<interval>_<old_end>_update_<market>.part.csv`
-- `downloads/<market>/<symbol>_<interval>_<old_end>_update_<market>.part.log`
+- `downloads/<source>/<market>/<symbol>_<interval>_<old_end>_update_<source>_<market>.part.csv`
+- `downloads/<source>/<market>/<symbol>_<interval>_<old_end>_update_<source>_<market>.part.log`
 
 If an update completes successfully, the tool merges the old and new data into a refreshed CSV whose end date matches the latest candle, then removes the temporary part files.
 

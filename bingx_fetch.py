@@ -1,60 +1,54 @@
-import os
-import time
-import signal
 import argparse
+import os
 import re
+import signal
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-import pandas as pd
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional
+
+import pandas as pd
+import requests
 from dotenv import load_dotenv
-from typing import Optional
 
 load_dotenv()
 
-API_BASE_URL = "https://open-api.bingx.com/openApi"
-API_URLS = {
-    "swap": f"{API_BASE_URL}/swap/v3/quote/klines",
-    "spot": f"{API_BASE_URL}/spot/v2/market/kline",
-}
-SPOT_MAX_QUERY_RANGE_MS = 7 * 24 * 60 * 60 * 1000
 API_KEY = os.getenv("API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+BINGX_API_BASE_URL = "https://open-api.bingx.com/openApi"
+SPOT_MAX_QUERY_RANGE_MS = 7 * 24 * 60 * 60 * 1000
 
 HEADERS = {
     "X-BX-APIKEY": API_KEY,
 }
 
-# ======== HELPERS =======
-def get_downloads_path(market: str):
-    modpath = os.path.dirname(os.path.abspath(__file__))
-    downloads_path = os.path.join(modpath, "downloads", market)
-    os.makedirs(downloads_path, exist_ok=True)
-    return downloads_path
+
+@dataclass(frozen=True)
+class SourceConfig:
+    name: str
+    market_urls: dict[str, str]
+    default_market: str = "swap"
+    default_limit: int = 1000
+    market_max_query_range_ms: dict[str, int] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    symbol_transform: Callable[[str], str] = lambda symbol: symbol
+    response_normalizer: Callable[[str, object], list[dict]] | None = None
+    error_message_parser: Callable[[object], Optional[str]] | None = None
+
+    def get_api_url(self, market: str) -> str:
+        try:
+            return self.market_urls[market]
+        except KeyError as exc:
+            raise ValueError(f"Unknown market for source {self.name}: {market}") from exc
+
+    def supports_market(self, market: str) -> bool:
+        return market in self.market_urls
 
 
-def get_filepath(filename: str, market: str):
-    return os.path.join(get_downloads_path(market), filename)
-
-
-def build_data_filename(symbol: str, interval: str, fromdate: datetime, todate: datetime, market: str):
-    return (
-        f"{symbol}_{interval}_{fromdate.strftime('%Y-%m-%d')}_{todate.strftime('%Y-%m-%d')}_{market}.csv"
-    )
-
-
-def build_part_filename(symbol: str, interval: str, end_date: str, market: str):
-    return f"{symbol}_{interval}_{end_date}_update_{market}.part.csv"
-
-
-def get_api_url(market: str) -> str:
-    try:
-        return API_URLS[market]
-    except KeyError as exc:
-        raise ValueError(f"Unknown market: {market}") from exc
-
-
-def normalize_kline(market: str, raw_kline):
+def normalize_bingx_kline(market: str, raw_kline):
     if isinstance(raw_kline, dict):
         return raw_kline
 
@@ -70,13 +64,143 @@ def normalize_kline(market: str, raw_kline):
             "quoteVolume": raw_kline[7] if len(raw_kline) > 7 else None,
         }
 
-    raise ValueError(f"Unsupported kline format for market {market}: {raw_kline}")
+    raise ValueError(f"Unsupported BingX kline format for market {market}: {raw_kline}")
 
 
-def normalize_klines(market: str, raw_klines):
-    normalized = [normalize_kline(market, item) for item in raw_klines]
+def normalize_binance_kline(raw_kline):
+    if isinstance(raw_kline, dict):
+        return raw_kline
+
+    if isinstance(raw_kline, (list, tuple)) and len(raw_kline) >= 6:
+        return {
+            "time": raw_kline[0],
+            "open": raw_kline[1],
+            "high": raw_kline[2],
+            "low": raw_kline[3],
+            "close": raw_kline[4],
+            "volume": raw_kline[5],
+            "closeTime": raw_kline[6] if len(raw_kline) > 6 else None,
+            "quoteVolume": raw_kline[7] if len(raw_kline) > 7 else None,
+            "trades": raw_kline[8] if len(raw_kline) > 8 else None,
+            "takerBaseVolume": raw_kline[9] if len(raw_kline) > 9 else None,
+            "takerQuoteVolume": raw_kline[10] if len(raw_kline) > 10 else None,
+        }
+
+    raise ValueError(f"Unsupported Binance kline format: {raw_kline}")
+
+
+def normalize_klines(raw_klines, normalizer: Callable[[object], dict]):
+    normalized = [normalizer(item) for item in raw_klines]
     normalized.sort(key=lambda item: int(item["time"]))
     return normalized
+
+
+def normalize_bingx_response(market: str, data):
+    if data.get("code") and data["code"] != 0:
+        raise ValueError(f"API error: {data.get('msg')}")
+
+    return normalize_klines(data["data"], lambda item: normalize_bingx_kline(market, item))
+
+
+def normalize_binance_response(_market: str, data):
+    if isinstance(data, dict) and "msg" in data:
+        raise ValueError(f"API error: {data['msg']}")
+
+    return normalize_klines(data, normalize_binance_kline)
+
+
+def extract_bingx_error_message(data) -> Optional[str]:
+    if isinstance(data, dict) and data.get("code") and data["code"] != 0:
+        return data.get("msg")
+    return None
+
+
+def extract_binance_error_message(data) -> Optional[str]:
+    if isinstance(data, dict) and data.get("msg"):
+        return data["msg"]
+    return None
+
+
+def normalize_binance_symbol(symbol: str) -> str:
+    return symbol.replace("-", "").replace("/", "").upper()
+
+
+SOURCES: dict[str, SourceConfig] = {
+    "bingx": SourceConfig(
+        name="bingx",
+        market_urls={
+            "swap": f"{BINGX_API_BASE_URL}/swap/v3/quote/klines",
+            "spot": f"{BINGX_API_BASE_URL}/spot/v2/market/kline",
+        },
+        default_market="swap",
+        default_limit=1400,
+        market_max_query_range_ms={"spot": SPOT_MAX_QUERY_RANGE_MS},
+        headers=HEADERS,
+        symbol_transform=lambda symbol: symbol,
+        response_normalizer=normalize_bingx_response,
+        error_message_parser=extract_bingx_error_message,
+    ),
+    "binance": SourceConfig(
+        name="binance",
+        market_urls={
+            "spot": "https://api.binance.com/api/v3/klines",
+            "swap": "https://fapi.binance.com/fapi/v1/klines",
+        },
+        default_market="spot",
+        default_limit=1000,
+        symbol_transform=normalize_binance_symbol,
+        response_normalizer=normalize_binance_response,
+        error_message_parser=extract_binance_error_message,
+    ),
+}
+
+# Backward-compatible aliases used by existing tests and callers.
+API_URLS = SOURCES["bingx"].market_urls
+
+
+def get_source_config(source: str) -> SourceConfig:
+    try:
+        return SOURCES[source]
+    except KeyError as exc:
+        raise ValueError(f"Unknown source: {source}") from exc
+
+
+def supported_markets_for_source(source: str) -> list[str]:
+    return sorted(get_source_config(source).market_urls.keys())
+
+
+# ======== HELPERS =======
+def get_downloads_path(market: str, source: str = "bingx"):
+    modpath = os.path.dirname(os.path.abspath(__file__))
+    downloads_path = os.path.join(modpath, "downloads", source, market)
+    os.makedirs(downloads_path, exist_ok=True)
+    return downloads_path
+
+
+def get_filepath(filename: str, market: str, source: str = "bingx"):
+    return os.path.join(get_downloads_path(market, source), filename)
+
+
+def build_data_filename(
+    symbol: str,
+    interval: str,
+    fromdate: datetime,
+    todate: datetime,
+    market: str,
+    source: str,
+):
+    return (
+        f"{symbol}_{interval}_{fromdate.strftime('%Y-%m-%d')}_{todate.strftime('%Y-%m-%d')}_"
+        f"{source}_{market}.csv"
+    )
+
+
+def build_part_filename(symbol: str, interval: str, end_date: str, market: str, source: str):
+    return f"{symbol}_{interval}_{end_date}_update_{source}_{market}.part.csv"
+
+
+def get_api_url(source: str, market: str) -> str:
+    return get_source_config(source).get_api_url(market)
 
 
 def datetime_to_ms(foo):
@@ -90,6 +214,8 @@ def ms_to_datetime(foo):
 def datetime_series_to_ms(series):
     dt = pd.to_datetime(series)
     return dt.map(datetime_to_ms)
+
+
 # ====== END HELPERS ======
 
 # глобальные переменные
@@ -133,19 +259,21 @@ def interval_to_ms(interval: str) -> int:
 
 
 def get_request_end_ms(
+    source: str,
     market: str,
     interval: str,
     start_ms: int,
     final_end_ms: int,
     limit: int,
 ) -> int:
+    config = get_source_config(source)
     interval_ms = interval_to_ms(interval)
     max_by_limit = start_ms + (limit * interval_ms) - interval_ms
     end_candidates = [final_end_ms, max_by_limit]
 
-    if market == "spot":
-        max_by_market = start_ms + SPOT_MAX_QUERY_RANGE_MS - interval_ms
-        end_candidates.append(max_by_market)
+    max_by_market = config.market_max_query_range_ms.get(market)
+    if max_by_market is not None:
+        end_candidates.append(start_ms + max_by_market - interval_ms)
 
     return min(end_candidates)
 
@@ -155,27 +283,34 @@ def is_spot_range_error(error: Exception) -> bool:
 
 
 def fetch_klines_with_adaptive_range(
+    source: str,
     market: str,
     symbol: str,
     interval: str,
     start_ms: int,
     final_end_ms: int,
-    limit: int = 1400,
+    limit: Optional[int] = None,
 ):
+    config = get_source_config(source)
+    request_limit = limit or config.default_limit
     request_end_ms = get_request_end_ms(
+        source=source,
         market=market,
         interval=interval,
         start_ms=start_ms,
         final_end_ms=final_end_ms,
-        limit=limit,
+        limit=request_limit,
     )
     interval_ms = interval_to_ms(interval)
 
     while True:
         try:
-            return fetch_klines(market, symbol, interval, start_ms, request_end_ms, limit), request_end_ms
+            return (
+                fetch_klines(source, market, symbol, interval, start_ms, request_end_ms, request_limit),
+                request_end_ms,
+            )
         except ValueError as exc:
-            if market != "spot" or not is_spot_range_error(exc):
+            if source != "bingx" or market != "spot" or not is_spot_range_error(exc):
                 raise
 
             next_end_ms = start_ms + max(((request_end_ms - start_ms) // 2), interval_ms)
@@ -187,18 +322,19 @@ def fetch_klines_with_adaptive_range(
             request_end_ms = next_end_ms
 
 
-def fetch_klines(
-    market: str,
+def build_request_params(
+    source: str,
     symbol: str,
     interval: str,
     start_ms: Optional[int] = None,
     end_ms: Optional[int] = None,
-    limit: int = 1400,
+    limit: Optional[int] = None,
 ):
+    config = get_source_config(source)
     params = {
-        "symbol": symbol,
+        "symbol": config.symbol_transform(symbol),
         "interval": interval,
-        "limit": limit,
+        "limit": limit or config.default_limit,
     }
 
     if start_ms is not None:
@@ -207,14 +343,33 @@ def fetch_klines(
     if end_ms is not None:
         params["endTime"] = end_ms
 
-    resp = requests.get(get_api_url(market), params=params, headers=HEADERS, timeout=10)
+    return params
+
+
+def fetch_klines(
+    source: str,
+    market: str,
+    symbol: str,
+    interval: str,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
+    limit: Optional[int] = None,
+):
+    config = get_source_config(source)
+    params = build_request_params(source, symbol, interval, start_ms, end_ms, limit)
+    resp = requests.get(
+        get_api_url(source, market),
+        params=params,
+        headers=config.headers,
+        timeout=10,
+    )
     resp.raise_for_status()
 
     data = resp.json()
-    if data.get("code") and data["code"] != 0:
-        raise ValueError(f"API error: {data.get('msg')}")
+    if config.response_normalizer is None:
+        raise ValueError(f"Source {source} does not have a response normalizer configured.")
 
-    return normalize_klines(market, data["data"])
+    return config.response_normalizer(market, data)
 
 
 def write_log(msg: str):
@@ -272,8 +427,25 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-def fetch_and_save(market="swap", symbol="ETH-USDT", interval="5m", fromdate=None, todate=None):
+def validate_market_for_source(source: str, market: str):
+    if not get_source_config(source).supports_market(market):
+        supported = ", ".join(supported_markets_for_source(source))
+        raise ValueError(f"Source '{source}' does not support market '{market}'. Supported: {supported}")
+
+
+def fetch_and_save(
+    source="bingx",
+    market: Optional[str] = None,
+    symbol="ETH-USDT",
+    interval="5m",
+    fromdate=None,
+    todate=None,
+):
     global all_klines, filepath, logfilepath
+
+    config = get_source_config(source)
+    market = market or config.default_market
+    validate_market_for_source(source, market)
 
     if todate is None:
         todate = datetime.now()
@@ -281,14 +453,14 @@ def fetch_and_save(market="swap", symbol="ETH-USDT", interval="5m", fromdate=Non
     if fromdate is None:
         fromdate = todate - timedelta(days=60)
 
-    filename = build_data_filename(symbol, interval, fromdate, todate, market)
+    filename = build_data_filename(symbol, interval, fromdate, todate, market, source)
     logfilename = filename.replace(".csv", ".log")
-    filepath = get_filepath(filename, market)
-    logfilepath = get_filepath(logfilename, market)
+    filepath = get_filepath(filename, market, source)
+    logfilepath = get_filepath(logfilename, market, source)
 
-    # Логируем старт
     log_start_msg = (
         f"[START] Запуск скрипта с параметрами:\n"
+        f"  source = {source}\n"
         f"  market = {market}\n"
         f"  symbol = {symbol}\n"
         f"  interval = {interval}\n"
@@ -298,7 +470,6 @@ def fetch_and_save(market="swap", symbol="ETH-USDT", interval="5m", fromdate=Non
     print(f"{Color.CYAN}{log_start_msg}{Color.RESET}")
     write_log(log_start_msg)
 
-    # Проверка существующего CSV
     if os.path.exists(filepath):
         df = pd.read_csv(filepath)
         if not df.empty:
@@ -322,17 +493,18 @@ def fetch_and_save(market="swap", symbol="ETH-USDT", interval="5m", fromdate=Non
         current_time_ms = datetime_to_ms(fromdate)
 
     end_ms = datetime_to_ms(todate)
+    request_limit = config.default_limit
 
-    # Основной цикл загрузки
     while current_time_ms < end_ms and not interrupted:
         try:
             chunk, request_end_ms = fetch_klines_with_adaptive_range(
+                source=source,
                 market=market,
                 symbol=symbol,
                 interval=interval,
                 start_ms=current_time_ms,
                 final_end_ms=end_ms,
-                limit=1400,
+                limit=request_limit,
             )
         except Exception as e:
             msg = f"[ERROR] Ошибка сети: {e}, жду 10 сек..."
@@ -356,19 +528,17 @@ def fetch_and_save(market="swap", symbol="ETH-USDT", interval="5m", fromdate=Non
             f"{Color.CYAN}Загружено {len(all_klines)} свечей, до {ms_to_datetime(last_open_ms)}{Color.RESET}"
         )
 
-        if len(chunk) < 1000:
+        if len(chunk) < request_limit:
             break
 
-        time.sleep(0.5)  # защита от rate limit
+        time.sleep(0.5)
 
-    # Логируем завершение
     save_progress()
     write_log("[END] Загрузка завершена")
     print(f"{Color.BOLD}{Color.GREEN}✅ [END] Загрузка завершена.{Color.RESET}")
 
 
 def valid_date(date_str):
-    """Проверка формата даты YYYY-MM-DD"""
     try:
         return datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
@@ -380,14 +550,20 @@ def valid_date(date_str):
 def parse_download_filename(filename: str):
     pattern = (
         r"^(?P<symbol>[^_]+)_(?P<interval>[^_]+)_(?P<start>\d{4}-\d{2}-\d{2})_"
-        r"(?P<end>\d{4}-\d{2}-\d{2})_(?P<market>swap|spot)\.csv$"
+        r"(?P<end>\d{4}-\d{2}-\d{2})_(?P<source>[^_]+)_(?P<market>swap|spot)\.csv$"
     )
     match = re.match(pattern, filename)
     return match.groupdict() if match else None
 
 
 def fetch_to_file_with_resume(
-    market: str, symbol: str, interval: str, fromdate: datetime, todate: datetime, target_path: str
+    source: str,
+    market: str,
+    symbol: str,
+    interval: str,
+    fromdate: datetime,
+    todate: datetime,
+    target_path: str,
 ):
     local_klines = []
     local_log_path = (
@@ -396,6 +572,7 @@ def fetch_to_file_with_resume(
         else f"{target_path}.log"
     )
     end_ms = datetime_to_ms(todate)
+    request_limit = get_source_config(source).default_limit
 
     if os.path.exists(target_path):
         df = pd.read_csv(target_path)
@@ -419,12 +596,13 @@ def fetch_to_file_with_resume(
     while current_time_ms < end_ms and not interrupted:
         try:
             chunk, request_end_ms = fetch_klines_with_adaptive_range(
+                source=source,
                 market=market,
                 symbol=symbol,
                 interval=interval,
                 start_ms=current_time_ms,
                 final_end_ms=end_ms,
-                limit=1400,
+                limit=request_limit,
             )
         except Exception as e:
             msg = f"[ERROR] Ошибка сети: {e}, жду 10 сек..."
@@ -455,7 +633,7 @@ def fetch_to_file_with_resume(
             f"{Color.CYAN}Докачано {len(local_klines)} свечей в {os.path.basename(target_path)}, до {ms_to_datetime(last_open_ms)}{Color.RESET}"
         )
 
-        if len(chunk) < 1000:
+        if len(chunk) < request_limit:
             break
 
         time.sleep(0.5)
@@ -469,9 +647,10 @@ def _build_update_task(downloads_path: str, filename: str, today):
     if not parsed:
         return None
 
+    source = parsed["source"]
+    market = parsed["market"]
     symbol = parsed["symbol"]
     interval = parsed["interval"]
-    market = parsed["market"]
     csv_path = os.path.join(downloads_path, filename)
 
     try:
@@ -503,6 +682,7 @@ def _build_update_task(downloads_path: str, filename: str, today):
         "downloads_path": downloads_path,
         "filename": filename,
         "parsed": parsed,
+        "source": source,
         "market": market,
         "symbol": symbol,
         "interval": interval,
@@ -516,6 +696,7 @@ def _build_update_task(downloads_path: str, filename: str, today):
 
 def _update_existing_file_task(task):
     filename = task["filename"]
+    source = task["source"]
     market = task["market"]
     symbol = task["symbol"]
     interval = task["interval"]
@@ -526,7 +707,7 @@ def _update_existing_file_task(task):
     parsed = task["parsed"]
     downloads_path = task["downloads_path"]
 
-    part_filename = build_part_filename(symbol, interval, parsed["end"], market)
+    part_filename = build_part_filename(symbol, interval, parsed["end"], market, source)
     part_csv_path = os.path.join(downloads_path, part_filename)
     part_log_path = os.path.join(downloads_path, part_filename.replace(".csv", ".log"))
     msg = (
@@ -537,6 +718,7 @@ def _update_existing_file_task(task):
     write_log_to(msg, part_log_path)
 
     completed = fetch_to_file_with_resume(
+        source=source,
         symbol=symbol,
         interval=interval,
         market=market,
@@ -576,6 +758,7 @@ def _update_existing_file_task(task):
         fromdate=datetime.strptime(file_start, "%Y-%m-%d"),
         todate=datetime.strptime(new_end, "%Y-%m-%d"),
         market=market,
+        source=source,
     )
     new_logfilename = new_filename.replace(".csv", ".log")
     new_csv_path = os.path.join(downloads_path, new_filename)
@@ -638,7 +821,9 @@ def _update_existing_files_in_dir(downloads_path: str, multithreading: bool = Tr
         return
 
     workers = min(os.cpu_count() or 1, len(tasks))
-    print(f"{Color.CYAN}Многопоточный режим: {workers} поток(ов), файлов к обновлению: {len(tasks)}.{Color.RESET}")
+    print(
+        f"{Color.CYAN}Многопоточный режим: {workers} поток(ов), файлов к обновлению: {len(tasks)}.{Color.RESET}"
+    )
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(_update_existing_file_task, task) for task in tasks]
         for future in as_completed(futures):
@@ -651,47 +836,77 @@ def _update_existing_files_in_dir(downloads_path: str, multithreading: bool = Tr
                 return
 
 
-def update_existing_files(multithreading: bool = True, market: Optional[str] = None):
-    if market:
-        _update_existing_files_in_dir(get_downloads_path(market), multithreading=multithreading)
+def update_existing_files(
+    multithreading: bool = True,
+    market: Optional[str] = None,
+    source: Optional[str] = None,
+):
+    if source:
+        markets = [market] if market else supported_markets_for_source(source)
+        for market_name in markets:
+            validate_market_for_source(source, market_name)
+            _update_existing_files_in_dir(
+                get_downloads_path(market_name, source),
+                multithreading=multithreading,
+            )
         return
 
-    for market_name in API_URLS:
-        _update_existing_files_in_dir(get_downloads_path(market_name), multithreading=multithreading)
+    for source_name, config in SOURCES.items():
+        markets = [market] if market else sorted(config.market_urls.keys())
+        for market_name in markets:
+            validate_market_for_source(source_name, market_name)
+            _update_existing_files_in_dir(
+                get_downloads_path(market_name, source_name),
+                multithreading=multithreading,
+            )
 
 
 def main():
     global write_log_enabled
 
+    source_names = sorted(SOURCES.keys())
+    all_markets = sorted({market for config in SOURCES.values() for market in config.market_urls})
+    source_default_text = ", ".join(
+        f"{name}: {config.default_market}" for name, config in sorted(SOURCES.items())
+    )
+
     parser = argparse.ArgumentParser(
-        description="""Скачивание исторических данных свечей с BingX API.
+        description="""Скачивание исторических данных свечей из разных источников.
 Примеры использования:
-1. По умолчанию (ETH-USDT, 5m, 60 дней):
+1. По умолчанию (bingx, ETH-USDT, 5m, 60 дней):
    python bingx_fetch.py
 2. С конкретной парой и интервалом:
    python bingx_fetch.py --symbol BTC-USDT --interval 1h
-2a. Для spot рынка:
-   python bingx_fetch.py --market spot --symbol BTC-USDT --interval 1h
-2b. Обновить все рынки сразу:
+3. Скачать из Binance:
+   python bingx_fetch.py --source binance --market spot --symbol BTC-USDT --interval 1h
+4. Обновить все скачанные рынки из всех источников:
    python bingx_fetch.py --update-existing
-3. За последние N дней:
-   python bingx_fetch.py --symbol ETH-USDT --interval 5m --lastdays 90
-4. За конкретный период:
+5. За конкретный период:
    python bingx_fetch.py --symbol ETH-USDT --interval 5m --fromdate 2025-07-01 --todate 2025-08-01
 """
     )
     parser.add_argument(
+        "--source",
+        type=str,
+        choices=source_names,
+        default="bingx",
+        help="Источник данных. Сейчас поддерживаются: %(choices)s",
+    )
+    parser.add_argument(
         "--market",
         type=str,
-        choices=sorted(API_URLS.keys()),
+        choices=all_markets,
         default=None,
-        help="Рынок для загрузки: swap или spot. Для --update-existing без параметра будут обновлены оба рынка",
+        help=(
+            "Рынок для загрузки. Если не указан, используется дефолтный рынок источника "
+            f"({source_default_text}). Для --update-existing без --source обновляются все источники и рынки."
+        ),
     )
     parser.add_argument(
         "--symbol",
         type=str,
         default="ETH-USDT",
-        help="Торговая пара (например ETH-USDT)",
+        help="Торговая пара (например ETH-USDT; для Binance будет автоматически преобразована в BTCUSDT-формат)",
     )
     parser.add_argument(
         "--interval",
@@ -726,21 +941,30 @@ def main():
     args = parser.parse_args()
     write_log_enabled = args.write_log
 
+    if args.market:
+        validate_market_for_source(args.source, args.market)
+
+    source_was_explicit = any(
+        arg == "--source" or arg.startswith("--source=") for arg in sys.argv[1:]
+    )
+
     if args.update_existing:
         if args.lastdays or args.fromdate or args.todate:
             raise ValueError(
                 "С флагом --update-existing нельзя использовать --lastdays, --fromdate и --todate."
             )
-        update_existing_files(multithreading=not args.no_multithreading, market=args.market)
+        update_existing_files(
+            multithreading=not args.no_multithreading,
+            market=args.market,
+            source=args.source if source_was_explicit else None,
+        )
         return
 
-    # Проверка конфликтов
     if args.lastdays and (args.fromdate or args.todate):
         raise ValueError(
             "Если указан --lastdays, то нельзя задавать --fromdate или --todate. --lastdays имеет приоритет."
         )
 
-    # Определяем период
     if args.lastdays:
         todate = datetime.now()
         fromdate = todate - timedelta(days=args.lastdays)
@@ -752,7 +976,6 @@ def main():
                 f"Дата начала {fromdate.strftime('%Y-%m-%d')} должна быть меньше даты конца {todate.strftime('%Y-%m-%d')}."
             )
     elif args.fromdate:
-        # По умолчанию 60 дней
         todate = datetime.now()
         fromdate = args.fromdate
         if fromdate >= todate:
@@ -760,12 +983,12 @@ def main():
                 f"Дата начала {fromdate.strftime('%Y-%m-%d')} должна быть меньше даты конца {todate.strftime('%Y-%m-%d')}."
             )
     else:
-        # По умолчанию 60 дней
         todate = datetime.now()
         fromdate = todate - timedelta(days=60)
 
     fetch_and_save(
-        market=args.market or "swap",
+        source=args.source,
+        market=args.market,
         symbol=args.symbol,
         interval=args.interval,
         fromdate=fromdate,
